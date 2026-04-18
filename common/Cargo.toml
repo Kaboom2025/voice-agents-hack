@@ -1,0 +1,13 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+data-encoding.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tokio.workspace = true

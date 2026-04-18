@@ -1,0 +1,18 @@
+[package]
+name = "leader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "leader"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common = { path = "../common" }
+iroh.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

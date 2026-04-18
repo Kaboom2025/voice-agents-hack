@@ -1,0 +1,19 @@
+[package]
+name = "follower"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "follower"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common = { path = "../common" }
+iroh.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
