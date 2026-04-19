@@ -362,23 +362,17 @@ async fn run_session(
             audio_samples,
         };
 
-        // Embed on a blocking thread — Cactus on CPU is slow.
+        // Async embed — Gemini awaits HTTP directly; Cactus offloads to
+        // spawn_blocking internally; synthetic returns instantly.
         let seq = *total_sent;
-        let emb = embedder.clone();
-        
-        let embed_handle = tokio::task::spawn_blocking(move || {
-            emb.embed_chunk(&input, seq)
-        });
+        let embed_fut = embedder.embed_chunk(&input, seq);
+        tokio::pin!(embed_fut);
 
         let out = tokio::select! {
-            res = embed_handle => match res {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "embed failed, skipping chunk");
-                    continue;
-                }
+            res = &mut embed_fut => match res {
+                Ok(o) => o,
                 Err(e) => {
-                    warn!(error = %e, "embed task panicked");
+                    warn!(error = %e, "embed failed, skipping chunk");
                     continue;
                 }
             },

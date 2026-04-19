@@ -95,7 +95,7 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
             frames: vec![dummy.clone(); 4],
             audio_samples: Vec::new(),
         };
-        let out = embedder.embed_chunk(&input, seq).unwrap();
+        let out = embedder.embed_chunk(&input, seq).await.unwrap();
         let chunk = common::EmbeddingChunk {
             chunk_id: format!("cam-test-{seq}"),
             camera_id: "cam-test".into(),

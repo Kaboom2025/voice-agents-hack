@@ -15,6 +15,7 @@ use std::sync::Arc;
 #[cfg(feature = "cactus")]
 use anyhow::Context;
 use anyhow::Result;
+use async_trait::async_trait;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 #[cfg(feature = "cactus")]
@@ -52,11 +53,16 @@ pub struct ChunkInput {
 
 /// Turns a chunk (multiple frames + audio) into an embedding vector +
 /// an optional caption.
+///
+/// Async because some embedders (Gemini) call out over HTTP. CPU-bound
+/// implementations (Cactus) should offload the heavy work to
+/// `tokio::task::spawn_blocking` internally.
+#[async_trait]
 pub trait Embedder: Send + Sync {
     /// Dimensionality this embedder produces. 0 means "variable".
     fn dim(&self) -> usize;
 
-    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput>;
+    async fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput>;
 }
 
 pub struct EmbeddingOutput {
@@ -71,6 +77,7 @@ pub struct EmbeddingOutput {
 // --- Cactus-backed embedder -----------------------------------------
 
 #[cfg(feature = "cactus")]
+#[derive(Clone)]
 pub struct CactusEmbedder {
     model: Arc<CactusModel>,
     tmp_dir: std::path::PathBuf,
@@ -168,12 +175,8 @@ impl CactusEmbedder {
 }
 
 #[cfg(feature = "cactus")]
-impl Embedder for CactusEmbedder {
-    fn dim(&self) -> usize {
-        0
-    }
-
-    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
+impl CactusEmbedder {
+    fn embed_chunk_blocking(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
         let mut video_emb = self.embed_frames(&input.frames, seq)?;
         let video_dim = video_emb.len();
         l2_normalize(&mut video_emb);
@@ -208,6 +211,26 @@ impl Embedder for CactusEmbedder {
     }
 }
 
+#[cfg(feature = "cactus")]
+#[async_trait]
+impl Embedder for CactusEmbedder {
+    fn dim(&self) -> usize {
+        0
+    }
+
+    async fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
+        let this = self.clone();
+        let frames = input.frames.clone();
+        let audio_samples = input.audio_samples.clone();
+        tokio::task::spawn_blocking(move || {
+            let input = ChunkInput { frames, audio_samples };
+            this.embed_chunk_blocking(&input, seq)
+        })
+        .await
+        .context("cactus embed task join")?
+    }
+}
+
 // --- Synthetic (no model / no camera) -------------------------------
 
 pub struct SyntheticEmbedder {
@@ -224,12 +247,13 @@ impl SyntheticEmbedder {
     }
 }
 
+#[async_trait]
 impl Embedder for SyntheticEmbedder {
     fn dim(&self) -> usize {
         self.dim
     }
 
-    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
+    async fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
         let mut rng = StdRng::seed_from_u64(Self::seed(seq));
         // Video portion.
         let video_dim = self.dim;
@@ -278,10 +302,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn synthetic_embedding_is_l2_normalized() {
+    #[tokio::test]
+    async fn synthetic_embedding_is_l2_normalized() {
         let e = SyntheticEmbedder::new(128);
-        let out = e.embed_chunk(&dummy_chunk(false), 0).unwrap();
+        let out = e.embed_chunk(&dummy_chunk(false), 0).await.unwrap();
         assert_eq!(out.embedding.len(), 128);
         assert_eq!(out.video_dim, 128);
         assert_eq!(out.audio_dim, 0);
@@ -289,10 +313,10 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-4);
     }
 
-    #[test]
-    fn synthetic_with_audio_has_both_dims() {
+    #[tokio::test]
+    async fn synthetic_with_audio_has_both_dims() {
         let e = SyntheticEmbedder::new(128);
-        let out = e.embed_chunk(&dummy_chunk(true), 0).unwrap();
+        let out = e.embed_chunk(&dummy_chunk(true), 0).await.unwrap();
         assert_eq!(out.embedding.len(), 256);
         assert_eq!(out.video_dim, 128);
         assert_eq!(out.audio_dim, 128);
@@ -300,19 +324,19 @@ mod tests {
         assert!((norm - 1.0).abs() < 1e-4);
     }
 
-    #[test]
-    fn synthetic_embedding_is_deterministic() {
+    #[tokio::test]
+    async fn synthetic_embedding_is_deterministic() {
         let e = SyntheticEmbedder::new(16);
-        let a = e.embed_chunk(&dummy_chunk(false), 42).unwrap();
-        let b = e.embed_chunk(&dummy_chunk(false), 42).unwrap();
+        let a = e.embed_chunk(&dummy_chunk(false), 42).await.unwrap();
+        let b = e.embed_chunk(&dummy_chunk(false), 42).await.unwrap();
         assert_eq!(a.embedding, b.embedding);
     }
 
-    #[test]
-    fn synthetic_embedding_differs_across_seq() {
+    #[tokio::test]
+    async fn synthetic_embedding_differs_across_seq() {
         let e = SyntheticEmbedder::new(16);
-        let a = e.embed_chunk(&dummy_chunk(false), 0).unwrap();
-        let b = e.embed_chunk(&dummy_chunk(false), 1).unwrap();
+        let a = e.embed_chunk(&dummy_chunk(false), 0).await.unwrap();
+        let b = e.embed_chunk(&dummy_chunk(false), 1).await.unwrap();
         assert_ne!(a.embedding, b.embedding);
     }
 }

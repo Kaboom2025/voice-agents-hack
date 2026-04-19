@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nokhwa::{
     pixel_format::RgbFormat,
-    utils::{CameraIndex, RequestedFormat, RequestedFormatType},
+    utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
     Camera,
 };
 use tokio::sync::watch;
@@ -102,10 +102,25 @@ pub fn spawn(device_index: u32) -> Result<CameraHandle> {
 
 fn open_camera(device_index: u32) -> Result<Camera> {
     let index = CameraIndex::Index(device_index);
-    let requested =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-    let mut camera = Camera::new(index, requested)
-        .with_context(|| format!("open camera index {device_index}"))?;
+
+    // Prefer 1280x720 MJPEG @ 30fps — cuts Gemini upload bandwidth ~2x vs 1080p
+    // while staying a near-universal webcam format. Fall back to the camera's
+    // highest-framerate format if the target isn't available.
+    let target = CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 30);
+    let mut camera = match Camera::new(
+        index.clone(),
+        RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(target)),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "720p MJPEG unavailable, falling back to highest-framerate format");
+            Camera::new(
+                index,
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
+            )
+            .with_context(|| format!("open camera index {device_index}"))?
+        }
+    };
     camera.open_stream().context("start camera stream")?;
     let res = camera.resolution();
     info!(

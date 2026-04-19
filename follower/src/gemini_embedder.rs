@@ -46,23 +46,30 @@ impl GeminiEmbedder {
     }
 }
 
+#[async_trait]
 impl crate::embedder::Embedder for GeminiEmbedder {
     fn dim(&self) -> usize {
         0
     }
 
-    fn embed_chunk(&self, input: &ChunkInput, _seq: u64) -> Result<EmbeddingOutput> {
-        let b64_frames: Vec<String> = input
-            .frames
-            .iter()
-            .map(|f| GeminiVideoEmbedder::encode_jpeg_b64(f, self.jpeg_quality))
-            .collect::<Result<Vec<_>>>()?;
+    async fn embed_chunk(&self, input: &ChunkInput, _seq: u64) -> Result<EmbeddingOutput> {
+        // JPEG encode is CPU-bound — offload to a blocking thread so we
+        // don't hold up the async runtime while encoding 4 HD frames.
+        let frames = input.frames.clone();
+        let quality = self.jpeg_quality;
+        let b64_frames: Vec<String> = tokio::task::spawn_blocking(move || {
+            frames
+                .iter()
+                .map(|f| GeminiVideoEmbedder::encode_jpeg_b64(f, quality))
+                .collect::<Result<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("jpeg encode task join: {e}"))??;
 
         anyhow::ensure!(!b64_frames.is_empty(), "no frames to embed");
 
         let n = b64_frames.len();
-        let handle = tokio::runtime::Handle::current();
-        let mut embedding = handle.block_on(self.client.embed(b64_frames))?;
+        let mut embedding = self.client.embed(b64_frames).await?;
 
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
