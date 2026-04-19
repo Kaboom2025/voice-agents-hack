@@ -45,7 +45,7 @@ impl EmbeddingStore {
             .iter()
             .filter(|sc| {
                 if let Some(start) = filter.time_start_ms {
-                    if sc.chunk.start_ts_ms < start {
+                    if sc.chunk.end_ts_ms < start {
                         return false;
                     }
                 }
@@ -125,8 +125,9 @@ mod tests {
             camera_ids: None,
             top_k: 10,
         });
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].chunk.start_ts_ms, 5000);
+        assert_eq!(results[1].chunk.start_ts_ms, 1000);
     }
 
     #[test]
