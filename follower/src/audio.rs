@@ -7,6 +7,7 @@
 //! **macOS first run:** grant microphone permission to your terminal app
 //! (System Settings > Privacy & Security > Microphone).
 
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -183,6 +184,29 @@ fn resample_if_needed(data: &[f32], source_rate: u32) -> Vec<f32> {
     out
 }
 
+/// Encode mono f32 audio samples to a 16-bit PCM WAV buffer in memory.
+/// Returns the complete WAV file as bytes (with RIFF header, fmt chunk, data chunk).
+pub fn encode_wav_bytes(samples: &[f32]) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let capacity = 44 + samples.len() * 2;
+    let buf = Vec::with_capacity(capacity);
+    let mut cursor = Cursor::new(buf);
+    let mut writer =
+        hound::WavWriter::new(&mut cursor, spec).expect("failed to create in-memory WAV writer");
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let sample = (clamped * i16::MAX as f32) as i16;
+        let _ = writer.write_sample(sample);
+    }
+    let _ = writer.finalize();
+    cursor.into_inner()
+}
+
 /// Write a mono f32 audio buffer to a 16-bit PCM WAV file at
 /// [`SAMPLE_RATE`]. Used to produce a file path for `cactus_audio_embed`.
 pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
@@ -192,8 +216,8 @@ pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer =
-        hound::WavWriter::create(path, spec).with_context(|| format!("create {}", path.display()))?;
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("create {}", path.display()))?;
     for &s in samples {
         // Clamp to [-1, 1] then scale to i16 range.
         let clamped = s.clamp(-1.0, 1.0);
@@ -204,4 +228,32 @@ pub fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<()> {
         .finalize()
         .with_context(|| format!("finalize {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_wav_bytes_has_riff_header() {
+        let samples = vec![0.0; 100];
+        let buf = encode_wav_bytes(&samples);
+        assert!(buf.starts_with(b"RIFF"));
+        assert!(buf.len() >= 44);
+    }
+
+    #[test]
+    fn encode_wav_bytes_has_wave_marker() {
+        let samples = vec![0.0; 100];
+        let buf = encode_wav_bytes(&samples);
+        assert_eq!(&buf[8..12], b"WAVE");
+    }
+
+    #[test]
+    fn encode_wav_bytes_length_matches_samples() {
+        let samples = vec![0.5; 1000];
+        let buf = encode_wav_bytes(&samples);
+        // RIFF header (44 bytes) + 2 bytes per i16 sample
+        assert_eq!(buf.len(), 44 + samples.len() * 2);
+    }
 }
