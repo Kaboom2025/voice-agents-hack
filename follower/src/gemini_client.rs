@@ -66,14 +66,12 @@ impl GeminiEmbedClient {
             content: Content { parts },
         };
 
-        let url = format!(
-            "{GEMINI_API_BASE}/{GEMINI_EMBED_MODEL}:embedContent?key={}",
-            self.api_key
-        );
+        let url = format!("{GEMINI_API_BASE}/{GEMINI_EMBED_MODEL}:embedContent");
 
         let resp = self
             .http
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .json(&req)
             .send()
             .await
@@ -81,7 +79,10 @@ impl GeminiEmbedClient {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<error reading body: {e}>"));
             anyhow::bail!("gemini API error {status}: {body}");
         }
 
@@ -136,8 +137,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_embed_single_frame() {
-        let Ok(key) = std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("gemini_api_key"))
+        let Ok(key) = std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("gemini_api_key"))
         else {
             eprintln!("GEMINI_API_KEY not set — skipping live test");
             return;
