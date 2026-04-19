@@ -1,31 +1,31 @@
-//! Follower CLI: webcam → Cactus (Gemma-4) embedding → iroh QUIC push.
+//! Follower CLI: webcam → Gemini video embedding → iroh QUIC push.
 //!
-//! Synthetic fallback kicks in automatically when either the model or
-//! the camera is unavailable (or when you pass `--synthetic`). That
-//! keeps the transport testable in CI / headless / no-GPU environments
+//! Embeds video windows (sliding frames) using GeminiVideoEmbedder, with synthetic
+//! fallback when the API key is unavailable or `--synthetic` is passed.
+//! That keeps the transport testable in CI / headless / no-GPU environments
 //! without changing the wire protocol.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use common::{
     read_frame, write_frame, EmbeddingChunk, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN,
 };
-#[cfg(feature = "cactus")]
-use follower::cactus::CactusModel;
 use follower::camera::{self, CapturedFrame};
-#[cfg(feature = "cactus")]
-use follower::embedder::CactusEmbedder;
-use follower::embedder::{Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
+use follower::embedder::GEMINI_EMBED_DIM;
+use follower::frame_buffer::FrameBuffer;
+use follower::gemini_embedder::{
+    GeminiVideoEmbedder, SyntheticVideoEmbedder, VideoEmbedder, VideoEmbeddingOutput,
+};
 use iroh::Endpoint;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(about = "iroh follower: capture webcam, embed via Gemma-4, push to leader")]
+#[command(about = "iroh follower: capture webcam, embed via Gemini, push to leader")]
 struct Args {
     /// Ticket string. If omitted, the follower reads it from `--ticket-file`.
     ticket: Option<String>,
@@ -38,9 +38,21 @@ struct Args {
     #[arg(long, default_value = "cam-0")]
     camera_id: String,
 
-    /// Milliseconds between chunks. Keep ≥ Cactus latency (~5s/image on CPU).
+    /// Milliseconds between embedding steps.
     #[arg(long, default_value_t = 5000)]
-    interval_ms: u64,
+    step_ms: u64,
+
+    /// Sliding video window size in milliseconds.
+    #[arg(long, default_value_t = 10_000)]
+    window_ms: u64,
+
+    /// Gemini API key. If set, uses GeminiVideoEmbedder. Falls back to synthetic.
+    #[arg(long, env = "GEMINI_API_KEY")]
+    gemini_api_key: Option<String>,
+
+    /// Force synthetic random vectors regardless of API key availability.
+    #[arg(long, default_value_t = false)]
+    synthetic: bool,
 
     /// Stop after this many chunks. 0 = run forever.
     #[arg(long, default_value_t = 0)]
@@ -49,18 +61,6 @@ struct Args {
     /// OS camera index (0 = default webcam).
     #[arg(long, default_value_t = 0)]
     device_index: u32,
-
-    /// Path to the Cactus-converted Gemma model directory.
-    #[arg(
-        long,
-        env = "GEMMA_MODEL_PATH",
-        default_value = "/opt/homebrew/opt/cactus/libexec/weights/gemma-4-e2b-it"
-    )]
-    model_path: PathBuf,
-
-    /// Skip Cactus entirely and ship synthetic random vectors.
-    #[arg(long, default_value_t = false)]
-    synthetic: bool,
 
     /// Skip the webcam and use a solid-color placeholder frame. Useful
     /// when you want real embeddings but no camera hardware.
@@ -136,8 +136,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("create frame dir {}", args.frame_dir.display()))?;
     info!(dir = %args.frame_dir.display(), "saving frames");
 
-    // --- Build the embedder --------------------------------------
-    let embedder: Arc<dyn Embedder> = build_embedder(&args).await?;
+    // --- Build the video embedder and frame buffer ------------------
+    let video_embedder = build_video_embedder(&args);
+    let frame_buffer = Arc::new(FrameBuffer::new(args.window_ms));
 
     // --- Build the frame source ----------------------------------
     let frames = if args.no_camera {
@@ -176,27 +177,26 @@ async fn main() -> Result<()> {
                     let writer = writer_for_reader.clone();
                     tokio::spawn(async move {
                         let resp = match frame {
-                            Some(f) => match tokio::task::spawn_blocking(move || {
-                                encode_jpeg(&f, 85)
-                            })
-                            .await
-                            {
-                                Ok(Ok((jpeg, w, h))) => FollowerMsg::FrameResponse {
-                                    req_id,
-                                    ts_ms: now_ms(),
-                                    width: w,
-                                    height: h,
-                                    jpeg,
-                                },
-                                Ok(Err(e)) => FollowerMsg::FrameError {
-                                    req_id,
-                                    message: format!("encode failed: {e}"),
-                                },
-                                Err(e) => FollowerMsg::FrameError {
-                                    req_id,
-                                    message: format!("encode task panicked: {e}"),
-                                },
-                            },
+                            Some(f) => {
+                                match tokio::task::spawn_blocking(move || encode_jpeg(&f, 85)).await
+                                {
+                                    Ok(Ok((jpeg, w, h))) => FollowerMsg::FrameResponse {
+                                        req_id,
+                                        ts_ms: now_ms(),
+                                        width: w,
+                                        height: h,
+                                        jpeg,
+                                    },
+                                    Ok(Err(e)) => FollowerMsg::FrameError {
+                                        req_id,
+                                        message: format!("encode failed: {e}"),
+                                    },
+                                    Err(e) => FollowerMsg::FrameError {
+                                        req_id,
+                                        message: format!("encode task panicked: {e}"),
+                                    },
+                                }
+                            }
                             None => FollowerMsg::FrameError {
                                 req_id,
                                 message: "no frame available yet".into(),
@@ -209,8 +209,33 @@ async fn main() -> Result<()> {
         }
     });
 
-    // --- Push loop ----------------------------------------------
-    let mut interval = tokio::time::interval(Duration::from_millis(args.interval_ms));
+    // --- Feeder task: push frames into the FrameBuffer ---------------
+    {
+        let buf = frame_buffer.clone();
+        let frames_clone = frames.clone();
+        tokio::spawn(async move {
+            // For Still frames, just push once and be done.
+            // For Cam, continuously watch for updates.
+            match frames_clone {
+                FrameSource::Still(f) => {
+                    buf.push(now_ms(), f);
+                }
+                FrameSource::Cam(mut rx) => {
+                    loop {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                        if let Some(frame) = rx.borrow().clone() {
+                            buf.push(now_ms(), frame);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // --- Push loop: emit embeddings on a sliding window schedule -----
+    let mut interval = tokio::time::interval(Duration::from_millis(args.step_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sent: u64 = 0;
     let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
@@ -218,32 +243,18 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Grab a frame.
-                let frame = match frames.current() {
-                    Some(f) => f,
-                    None => {
-                        warn!("camera has no frame yet, waiting for next tick");
-                        continue;
-                    }
+                let buf = frame_buffer.clone();
+                let emb = video_embedder.clone();
+                let out: VideoEmbeddingOutput = match emb.embed_window(&buf).await {
+                    Ok(o) => o,
+                    Err(e) => { warn!(error = %e, "embed_window failed, skipping chunk"); continue; }
                 };
 
-                // Embed on a blocking thread — Cactus on CPU is slow.
-                let seq = sent;
-                let emb = embedder.clone();
-                let out = match tokio::task::spawn_blocking(move || {
-                    emb.embed_frame(&frame, seq)
-                }).await {
-                    Ok(Ok(o)) => o,
-                    Ok(Err(e)) => { warn!(error = %e, "embed failed, skipping chunk"); continue; }
-                    Err(e) => { warn!(error = %e, "embed task panicked"); continue; }
-                };
-
-                let ts = now_ms();
                 let chunk = EmbeddingChunk {
                     chunk_id: format!("{}-{}", args.camera_id, sent),
                     camera_id: args.camera_id.clone(),
-                    start_ts_ms: ts,
-                    end_ts_ms: ts + args.interval_ms,
+                    start_ts_ms: out.start_ts_ms,
+                    end_ts_ms: out.end_ts_ms,
                     embedding: out.embedding,
                     caption: out.caption,
                 };
@@ -280,36 +291,17 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(feature = "cactus")]
-async fn build_embedder(args: &Args) -> Result<Arc<dyn Embedder>> {
+fn build_video_embedder(args: &Args) -> Arc<dyn VideoEmbedder> {
     if args.synthetic {
-        info!("embedder: synthetic (flag)");
-        return Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)));
+        info!("video embedder: synthetic (flag)");
+        return Arc::new(SyntheticVideoEmbedder::new(GEMINI_EMBED_DIM));
     }
-    let model_path = args.model_path.clone();
-    let model = tokio::task::spawn_blocking(move || CactusModel::new(&model_path))
-        .await
-        .context("join cactus init")?;
-    match model {
-        Ok(m) => {
-            info!(path = %args.model_path.display(), "cactus gemma-4 loaded");
-            Ok(Arc::new(
-                CactusEmbedder::new(Arc::new(m))
-                    .with_tmp_dir(args.frame_dir.clone())
-                    .with_file_prefix(args.camera_id.clone()),
-            ))
-        }
-        Err(e) => {
-            warn!(error = %e, "cactus init failed, falling back to synthetic");
-            Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)))
-        }
+    if let Some(ref key) = args.gemini_api_key {
+        info!("video embedder: GeminiVideoEmbedder (gemini-embedding-exp-03-07)");
+        return Arc::new(GeminiVideoEmbedder::new(key.clone()));
     }
-}
-
-#[cfg(not(feature = "cactus"))]
-async fn build_embedder(_args: &Args) -> Result<Arc<dyn Embedder>> {
-    info!("embedder: synthetic (cactus feature off)");
-    Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)))
+    info!("video embedder: synthetic (no GEMINI_API_KEY)");
+    Arc::new(SyntheticVideoEmbedder::new(GEMINI_EMBED_DIM))
 }
 
 /// Encode an in-memory RGB frame to JPEG. Returns `(bytes, width, height)`.
