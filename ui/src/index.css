@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  color: theme("colors.ink");
+  background: #ffffff;
+}
+
+@layer components {
+  .glass {
+    @apply bg-white border border-slate-200 shadow-glass;
+  }
+  .glass-soft {
+    @apply bg-slate-50 border border-slate-200/80;
+  }
+}

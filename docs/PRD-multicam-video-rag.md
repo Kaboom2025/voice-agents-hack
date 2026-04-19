@@ -24,6 +24,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 ## 2. Goals & Non-Goals
 
 ### 2.1 Goals (v1)
+
 - Support **N ≥ 4** concurrent camera/microphone follower nodes per client server.
 - Each follower performs **on-device** video frame + audio frame embedding using Cactus + Gemma 3 4B (no raw media leaves the follower by default).
 - Embeddings are streamed to the client server and persisted in **ChromaDB**.
@@ -32,6 +33,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 - Run on commodity hardware: follower = Apple Silicon Mac mini / Jetson-class / mid-range ARM SBC; client = single Linux box.
 
 ### 2.2 Non-Goals (v1)
+
 - Live alerting / streaming triggers ("notify me when X happens"). Defer to v2.
 - Cloud-hosted multi-tenant SaaS. v1 is single-tenant, self-hosted.
 - Re-identification / face recognition / person tracking across cameras as a first-class feature.
@@ -42,13 +44,16 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 
 ## 3. Users & Use Cases
 
-| Persona | Use case |
-|---|---|
-| Home/small-business operator | Ask "what happened today" across 4–8 cameras without cloud upload. |
-| Lab / robotics researcher | Query multi-robot video logs to find specific events for debugging. |
-| Security analyst | Time-bounded multi-feed forensic search ("show me everyone who entered between 2–4pm"). |
+
+| Persona                      | Use case                                                                                |
+| ---------------------------- | --------------------------------------------------------------------------------------- |
+| Home/small-business operator | Ask "what happened today" across 4–8 cameras without cloud upload.                      |
+| Lab / robotics researcher    | Query multi-robot video logs to find specific events for debugging.                     |
+| Security analyst             | Time-bounded multi-feed forensic search ("show me everyone who entered between 2–4pm"). |
+
 
 **Primary user flow:**
+
 1. Operator deploys 1 client server + N follower nodes (each with camera + mic).
 2. Followers continuously record, chunk, embed, and ship embeddings to the client.
 3. Operator opens the client UI/CLI, types a query, gets ranked results with thumbnails + camera ID + timestamp + jump-to-clip.
@@ -65,7 +70,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 │  └─────────┬───────────┘  │       │  └─────────┬───────────┘  │
 │            ▼              │       │            ▼              │
 │  ┌─────────────────────┐  │       │  ┌─────────────────────┐  │
-│  │ Chunker (video+audio)│  │       │  │ Chunker             │  │
+│  │ Chunker (video+audio)│  │      │  │ Chunker             │  │
 │  └─────────┬───────────┘  │       │  └─────────┬───────────┘  │
 │            ▼              │       │            ▼              │
 │  ┌─────────────────────┐  │       │  ┌─────────────────────┐  │
@@ -74,7 +79,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 │  └─────────┬───────────┘  │       │  └─────────┬───────────┘  │
 │            ▼              │       │            ▼              │
 │  ┌─────────────────────┐  │       │  ┌─────────────────────┐  │
-│  │ Local raw clip cache │  │       │  │ Local raw clip cache│  │
+│  │ Local raw clip cache│  │       │  │ Local raw clip cache│  │
 │  │ (rolling, optional) │  │       │  │                     │  │
 │  └─────────┬───────────┘  │       │  └─────────┬───────────┘  │
 │            ▼              │       │            ▼              │
@@ -115,6 +120,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 ### 5.1 Follower Node
 
 **Responsibilities**
+
 - Capture video (default 1080p @ 15 fps) and audio (16 kHz mono) from local devices.
 - Chunk the stream into fixed windows (default **5 s clips**, configurable 2–15 s).
 - For each chunk:
@@ -125,19 +131,23 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 - Maintain a **rolling local raw-clip cache** (default 24h, FIFO) so the client can fetch the actual video on demand for playback.
 
 **Interfaces (all over iroh QUIC, identified by ALPN)**
+
 - `cactus/ingest/v1` — long-lived bidirectional stream, follower → client. Length-prefixed CBOR `EmbeddingChunk` frames pushed as produced; client acks chunk_ids for at-least-once delivery + dedupe.
 - `cactus/control/v1` — bidirectional, client → follower. RPC-style: `GetConfig`, `SetConfig`, `Ping`, `RotateKeys`.
 - `cactus/clip/v1` — on-demand, client → follower. Request `chunk_id` → follower streams the raw MP4 segment back. Backed by **iroh-blobs** so transfers are resumable, content-addressed (BLAKE3), and dedup-friendly across followers.
 - Discovery: followers publish their `NodeId` via iroh's built-in **pkarr / DNS discovery**, plus a static client-side allowlist of permitted follower `NodeId`s.
 
 **Hardware target**
+
 - Apple Silicon (M-series), or ARM64 Linux with NEON; 8 GB+ RAM.
 - Cactus chosen specifically because it runs Gemma 3 4B on ARM CPU efficiently with low RAM (zero-copy mmap).
 
 **Implementation language**
+
 - Rust binary (`cactus-follower`). Cactus is invoked via its C FFI through a thin `cactus-sys` crate (autogenerated bindings against `cactus/ffi`). Audio/video capture via `nokhwa` + `cpal`, encoding via `ffmpeg-next` or `gstreamer-rs`.
 
 **Failure handling**
+
 - If client unreachable: iroh's QUIC stream errors trigger a switch to **local spool** (bounded ring buffer on disk, default 4 GB). On reconnect, drain spool oldest-first, deduped by `chunk_id`.
 - iroh handles NAT traversal (relay fallback), connection migration on network change, and 0-RTT resumption — followers on flaky Wi-Fi or LTE recover transparently.
 - If embedding falls behind real-time: drop frame samples first, drop captions second, drop entire chunks last (with metric).
@@ -154,6 +164,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 ### 5.3 Client Server
 
 **Responsibilities**
+
 - Run a single iroh `Endpoint` accepting connections on the ALPNs above. One Tokio task per accepted bidi stream.
 - Validate, dedupe (by `chunk_id`, secondary on `camera_id + start_ts`), and write to:
   - **ChromaDB** collections (`video_clips`, `audio_clips`, `captions`).
@@ -162,9 +173,11 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 - Manage follower registry: pin allowlist of follower `NodeId`s; iroh `Ping` over `cactus/control/v1` every 10 s for health; push config updates.
 
 **Implementation language**
+
 - Rust binary (`cactus-client`). Crates: `iroh`, `iroh-blobs`, `tokio`, `axum`, `sqlx`, `chromadb` (HTTP client to a sidecar Chroma instance, or `arroy`/`qdrant-client` if we move off Chroma later).
 
 **Storage estimates (rule-of-thumb)**
+
 - Per chunk: ~ (4 KB embedding) + (200 B caption) + (200 B metadata) ≈ 4.5 KB.
 - 8 cameras × 5 s chunks × 24 h ≈ 138 k chunks/day ≈ **~620 MB/day** of embeddings + metadata. Easily fits on a single SSD.
 - Raw video stays on followers; only fetched on demand.
@@ -172,6 +185,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 ### 5.4 Query / RAG Pipeline
 
 **API:** `POST /query`
+
 ```json
 {
   "query": "when did anyone enter the lab today?",
@@ -183,6 +197,7 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 ```
 
 **Pipeline**
+
 1. Embed the query with the **same** Gemma/Cactus stack (text-only mode) → query vector(s).
 2. Run filtered ANN search in each requested Chroma collection (filter on `camera_id ∈ …`, `start_ts ∈ range`).
 3. Reciprocal-rank-fuse results across modalities.
@@ -191,12 +206,14 @@ Current solutions either (a) require sending raw video to the cloud (expensive, 
 6. Return answer + ranked clip list. UI fetches raw clips lazily from the originating follower.
 
 **Latency budget (target)**
+
 - Query embed: < 200 ms
 - Chroma ANN: < 300 ms (8 cameras, 1 week of data)
 - LLM synthesis (4B on client GPU/CPU): < 4 s
 - Total p95: **< 5 s**
 
 ### 5.5 UI (v1: minimal)
+
 - Web SPA + CLI.
 - Query box, camera multi-select, time-range picker.
 - Result list: thumbnail, camera, timestamp, caption, "play clip" button (streams from follower), confidence score.
@@ -238,6 +255,7 @@ Chroma collections store the embedding + the same `chunk_id` as document ID, wit
 ## 8. Configuration
 
 Single YAML on each follower:
+
 ```yaml
 camera_id: cam-front-door
 client_node_id: k51qzi5uqu5dh...     # iroh NodeId (Ed25519 pubkey, z-base-32)
@@ -265,6 +283,7 @@ The follower's own `NodeId` is generated on first run and stored in `~/.cactus-f
 ## 9. Metrics & Observability
 
 Per follower:
+
 - `embedding_lag_seconds` (now − latest committed chunk end_ts)
 - `dropped_frames_total`, `dropped_chunks_total`
 - `embed_duration_ms` p50/p95
@@ -272,6 +291,7 @@ Per follower:
 - `iroh_conn_state` (direct | relayed | disconnected), `iroh_rtt_ms`, `iroh_relay_url`
 
 Per client:
+
 - `ingest_chunks_per_minute{camera}`
 - `query_latency_ms` p50/p95
 - `chroma_collection_size`
@@ -282,13 +302,15 @@ Per client:
 
 ## 10. Milestones
 
-| Milestone | Scope |
-|---|---|
-| M0 | Rust skeleton: `cactus-follower` + `cactus-client` exchanging dummy embeddings over iroh `cactus/ingest/v1`. Single follower → client → Chroma → CLI text query against captions only. |
-| M1 | Real Gemma/Cactus video+audio embeddings via `cactus-sys` FFI. Multi-follower (≥4). On-demand raw-clip fetch via `iroh-blobs` + `cactus/clip/v1`. Web UI with playback. |
-| M2 | Hybrid retrieval (dense+caption+audio) with reciprocal rank fusion + LLM synthesis with citations. |
-| M3 | Hardening: NodeId allowlist UX, follower spool/backfill, encrypted clip cache, metrics dashboard, iroh relay self-hosting option. |
-| M4 (v2) | Live alerts ("notify when X happens"), cross-camera entity linking, mobile follower app. |
+
+| Milestone | Scope                                                                                                                                                                                  |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| M0        | Rust skeleton: `cactus-follower` + `cactus-client` exchanging dummy embeddings over iroh `cactus/ingest/v1`. Single follower → client → Chroma → CLI text query against captions only. |
+| M1        | Real Gemma/Cactus video+audio embeddings via `cactus-sys` FFI. Multi-follower (≥4). On-demand raw-clip fetch via `iroh-blobs` + `cactus/clip/v1`. Web UI with playback.                |
+| M2        | Hybrid retrieval (dense+caption+audio) with reciprocal rank fusion + LLM synthesis with citations.                                                                                     |
+| M3        | Hardening: NodeId allowlist UX, follower spool/backfill, encrypted clip cache, metrics dashboard, iroh relay self-hosting option.                                                      |
+| M4 (v2)   | Live alerts ("notify when X happens"), cross-camera entity linking, mobile follower app.                                                                                               |
+
 
 ---
 
@@ -326,15 +348,17 @@ Key external crates: `iroh`, `iroh-blobs`, `tokio`, `serde`, `ciborium`, `axum`,
 
 ## 12. Risks
 
-| Risk | Mitigation |
-|---|---|
-| Gemma 3 4B vision embeddings are not discriminative enough for retrieval | Spike in M0; if poor, swap embedding model (e.g. SigLIP) but keep Gemma for caption + LLM synthesis. |
-| Followers can't keep up with real-time embedding | Reduce frames_per_chunk, increase chunk_seconds, or add a smaller embed-only model path. |
-| Network partition causes embedding loss | iroh auto-reconnect + local spool + backfill (bounded by disk). |
-| iroh hole-punching fails on hostile NATs | Falls back to relay automatically; document expected throughput hit (~10–30 Mbps via public relay) and offer self-hosted relay. |
-| `cactus` C FFI ABI changes break `cactus-sys` | Pin `cactus` to a specific tag in `Cargo.toml`; CI builds `cactus-sys` against the pinned version. |
-| Captions leak sensitive info | `disable_captions` flag; per-camera content-class allowlist (v2). |
-| Storage growth on client | Configurable retention; document per-camera/day cost; downsample old data to coarser chunks (v2). |
+
+| Risk                                                                     | Mitigation                                                                                                                      |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| Gemma 3 4B vision embeddings are not discriminative enough for retrieval | Spike in M0; if poor, swap embedding model (e.g. SigLIP) but keep Gemma for caption + LLM synthesis.                            |
+| Followers can't keep up with real-time embedding                         | Reduce frames_per_chunk, increase chunk_seconds, or add a smaller embed-only model path.                                        |
+| Network partition causes embedding loss                                  | iroh auto-reconnect + local spool + backfill (bounded by disk).                                                                 |
+| iroh hole-punching fails on hostile NATs                                 | Falls back to relay automatically; document expected throughput hit (~10–30 Mbps via public relay) and offer self-hosted relay. |
+| `cactus` C FFI ABI changes break `cactus-sys`                            | Pin `cactus` to a specific tag in `Cargo.toml`; CI builds `cactus-sys` against the pinned version.                              |
+| Captions leak sensitive info                                             | `disable_captions` flag; per-camera content-class allowlist (v2).                                                               |
+| Storage growth on client                                                 | Configurable retention; document per-camera/day cost; downsample old data to coarser chunks (v2).                               |
+
 
 ---
 
@@ -344,3 +368,4 @@ Key external crates: `iroh`, `iroh-blobs`, `tokio`, `serde`, `ciborium`, `axum`,
 - Operator can issue 10 representative natural-language queries and 8/10 return the correct camera + within ±10 s of the actual event.
 - p95 query latency < 5 s on a 1-week, 4-camera index.
 - Zero raw video bytes egress observed at the follower NIC during normal operation (verified by tcpdump).
+
