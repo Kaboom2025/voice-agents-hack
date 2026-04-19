@@ -82,6 +82,13 @@ export type LiveFrame = {
   poster_url: string;
 };
 
+export type PlaybackInfo = {
+  camera_id: string;
+  playlist_url: string;
+  start_ts_ms?: number;
+  available: boolean;
+};
+
 export interface ApiClient {
   listCameras(): Promise<Camera[]>;
   query(req: QueryRequest): Promise<QueryResponse>;
@@ -90,6 +97,7 @@ export interface ApiClient {
   rpcStream(req: RpcRequest): AsyncIterable<RpcEvent>;
   liveStream(cameraIds: string[], signal: AbortSignal): AsyncIterable<LiveFrame>;
   clipUrl(chunkId: string): string;
+  playback(cameraId: string, startTsMs?: number): Promise<PlaybackInfo>;
 }
 
 // ────────────────────────── HTTP client ──────────────────────────
@@ -168,6 +176,14 @@ export const httpClient: ApiClient = {
 
   clipUrl(chunkId) {
     return `/api/clips/${encodeURIComponent(chunkId)}`;
+  },
+
+  async playback(cameraId, startTsMs) {
+    const qs = new URLSearchParams({ camera_id: cameraId });
+    if (startTsMs !== undefined) qs.set("start_ts_ms", String(startTsMs));
+    const res = await fetch(`/api/playback?${qs.toString()}`);
+    if (!res.ok) throw new Error(`playback: ${res.status}`);
+    return (await res.json()) as PlaybackInfo;
   },
 };
 

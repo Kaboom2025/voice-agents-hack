@@ -14,3 +14,4 @@ pub mod embedder;
 pub mod frame_buffer;
 pub mod gemini_client;
 pub mod gemini_embedder;
+pub mod recorder;

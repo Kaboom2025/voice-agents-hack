@@ -9,6 +9,9 @@ cd "$(dirname "$0")/.."
 source .env 2>/dev/null || true
 CHROMA_PORT="${CHROMA_PORT:-8000}"
 LEADER_HTTP="${LEADER_HTTP_ADDR:-127.0.0.1:8080}"
+# HLS recording dir — must match the follower's --recordings-dir.
+RECORDINGS_DIR="${RECORDINGS_DIR:-./recordings}"
+export LEADER_RECORDINGS_DIR="$RECORDINGS_DIR"
 
 # ── Colors ────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -28,6 +31,13 @@ cleanup() {
     echo -e "${GREEN}All stopped.${NC}"
 }
 trap cleanup EXIT INT TERM
+
+# ── 0. Ensure the recordings dir exists so ServeDir doesn't 500 before
+#      the follower writes its first segment.
+mkdir -p "$RECORDINGS_DIR"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo -e "${YELLOW}WARNING: ffmpeg not on PATH — follower recording will be disabled and replay will show 'no recording'.${NC}"
+fi
 
 # ── 1. Build leader + follower (release) ─────────────────────────────
 echo -e "${CYAN}Building leader (cactus)...${NC}"
@@ -69,9 +79,10 @@ cd ..
 echo ""
 echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Leader stack running:${NC}"
-echo -e "    ChromaDB:  http://localhost:${CHROMA_PORT}"
-echo -e "    Leader:    http://${LEADER_HTTP}"
-echo -e "    UI:        http://localhost:5173"
+echo -e "    ChromaDB:   http://localhost:${CHROMA_PORT}"
+echo -e "    Leader:     http://${LEADER_HTTP}"
+echo -e "    UI:         http://localhost:5173"
+echo -e "    Recordings: ${RECORDINGS_DIR}  (served at /api/recordings)"
 echo -e ""
 echo -e "  ${YELLOW}Connect a follower:${NC}"
 echo -e "    cargo run --release -p follower --features cactus -- --camera-id cam-local"

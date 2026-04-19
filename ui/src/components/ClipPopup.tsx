@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, type ClipHit } from "../api";
+import { type ClipHit } from "../api";
+import { ReplayPlayer } from "./ReplayPlayer";
 
 interface ClipPopupProps {
   hits: ClipHit[];
@@ -55,15 +56,14 @@ export function ClipPopup({ hits, initialId, onClose }: ClipPopupProps) {
           </button>
         </div>
 
-        {/* Main player */}
+        {/* Main player — HLS replay that seeks to the retrieved moment
+            and keeps rolling forward through whatever the camera captured
+            after it. */}
         <div className="bg-slate-950 aspect-video">
-          <video
+          <ReplayPlayer
             key={active.chunk_id}
-            src={api.clipUrl(active.chunk_id)}
-            poster={active.thumbnail_url}
-            controls
-            autoPlay
-            className="w-full h-full object-contain"
+            cameraId={active.camera_id}
+            startTsMs={active.start_ts_ms}
           />
         </div>
 

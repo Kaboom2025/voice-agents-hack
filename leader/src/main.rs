@@ -104,6 +104,11 @@ struct Args {
     #[arg(long, env = "STORE_DIR", default_value = ".store")]
     store_dir: PathBuf,
 
+    /// Directory where HLS recordings land (same path the follower writes
+    /// to in the co-located demo setup). Served under `/api/recordings/`.
+    #[arg(long, env = "LEADER_RECORDINGS_DIR", default_value = "./recordings")]
+    recordings_dir: PathBuf,
+
     /// ChromaDB server URL. Start one with: `uvx --from chromadb chroma run`
     /// Set to empty string to disable ChromaDB.
     #[arg(long, env = "CHROMA_URL", default_value = "http://localhost:8000")]
@@ -228,7 +233,20 @@ async fn main() -> Result<()> {
         #[cfg(feature = "cactus")]
         llm,
         embed_cache: Arc::new(RwLock::new(EmbedCache::default())),
+        recordings_dir: args.recordings_dir.clone(),
     };
+
+    // Make sure the recordings dir exists so ServeDir doesn't 500 before
+    // the follower has written its first segment.
+    if let Err(e) = std::fs::create_dir_all(&args.recordings_dir) {
+        warn!(
+            dir = %args.recordings_dir.display(),
+            error = %e,
+            "failed to create recordings dir"
+        );
+    } else {
+        info!(dir = %args.recordings_dir.display(), "recordings served at /api/recordings");
+    }
 
     let handler = IngestHandler {
         state: app_state.clone(),
@@ -361,6 +379,10 @@ struct AppState {
     /// LLM synthesis is skipped, so caching repeat queries helps a lot
     /// when iterating on the Image Search debug page.
     embed_cache: Arc<RwLock<EmbedCache>>,
+    /// Where HLS recordings live on disk — served under `/api/recordings/`
+    /// and referenced by `/api/playback` to map retrieval timestamps back
+    /// to a playlist URL.
+    recordings_dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -609,6 +631,10 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let recordings_service = tower_http::services::ServeDir::new(&state.recordings_dir)
+        .precompressed_gzip()
+        .append_index_html_on_directories(false);
+
     let app = Router::new()
         .route("/api/cameras", get(list_cameras))
         .route("/api/live/:camera_id", get(live_jpg))
@@ -616,6 +642,8 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
         .route("/api/query", post(query))
         .route("/api/search", post(search))
         .route("/api/answer", post(answer))
+        .route("/api/playback", get(playback))
+        .nest_service("/api/recordings", recordings_service)
         .layer(cors)
         .with_state(state);
 
@@ -736,6 +764,64 @@ async fn thumbnail(
             .into_response(),
         None => (StatusCode::NOT_FOUND, "no thumbnail for this chunk").into_response(),
     }
+}
+
+// ──────────────────────────── playback ──────────────────────────────
+
+#[derive(Deserialize)]
+struct PlaybackParams {
+    camera_id: String,
+    /// Wall-clock ms the UI wants to start playing at. Echoed back so the
+    /// client can seek via HLS PROGRAM-DATE-TIME without computing offsets
+    /// itself.
+    start_ts_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PlaybackResp {
+    camera_id: String,
+    /// URL the UI feeds to hls.js.
+    playlist_url: String,
+    /// Echoed back unchanged; the UI uses it to seek the player.
+    start_ts_ms: Option<u64>,
+    /// Whether the playlist file exists on disk right now. Lets the UI
+    /// show a "no recording yet" state instead of a cryptic 404 from
+    /// hls.js.
+    available: bool,
+}
+
+/// Resolve `(camera_id, start_ts_ms)` → HLS playlist URL. The recording is
+/// a single rolling playlist per camera; playback UX (seeking to the exact
+/// start_ts_ms, continuing forward) is handled client-side via the
+/// `#EXT-X-PROGRAM-DATE-TIME` tags that ffmpeg emits.
+async fn playback(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<PlaybackParams>,
+) -> Json<PlaybackResp> {
+    // Basic sanitization — camera_id becomes a path segment. Reject
+    // anything containing path traversal characters.
+    let camera_id = params.camera_id;
+    let clean = !camera_id.is_empty()
+        && !camera_id.contains('/')
+        && !camera_id.contains('\\')
+        && !camera_id.contains("..");
+    let playlist_url = if clean {
+        format!("/api/recordings/{}/stream.m3u8", camera_id)
+    } else {
+        String::new()
+    };
+    let available = clean
+        && state
+            .recordings_dir
+            .join(&camera_id)
+            .join("stream.m3u8")
+            .is_file();
+    Json(PlaybackResp {
+        camera_id,
+        playlist_url,
+        start_ts_ms: params.start_ts_ms,
+        available,
+    })
 }
 
 // ──────────────────────────── query (RAG) ────────────────────────────

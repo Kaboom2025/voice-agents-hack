@@ -21,6 +21,7 @@ use follower::audio;
 #[cfg(feature = "cactus")]
 use follower::cactus::CactusModel;
 use follower::camera::{self, CapturedFrame};
+use follower::recorder::{self, RecorderConfig};
 #[cfg(feature = "cactus")]
 use follower::embedder::CactusEmbedder;
 use follower::embedder::{ChunkInput, Embedder};
@@ -93,6 +94,24 @@ struct Args {
     #[arg(long, env = "FOLLOWER_FRAME_DIR", default_value = "./frames")]
     frame_dir: PathBuf,
 
+    /// Directory where HLS recordings are written
+    /// (`<dir>/<camera_id>/stream.m3u8`). In the co-located demo setup
+    /// the leader serves this same path.
+    #[arg(long, env = "FOLLOWER_RECORDINGS_DIR", default_value = "./recordings")]
+    recordings_dir: PathBuf,
+
+    /// Disable HLS recording. Leave enabled to power UI replay.
+    #[arg(long, default_value_t = false)]
+    no_record: bool,
+
+    /// Target framerate for HLS recording (lower = smaller files).
+    #[arg(long, default_value_t = 15)]
+    record_fps: u32,
+
+    /// HLS segment length in seconds.
+    #[arg(long, default_value_t = 4)]
+    record_segment_secs: u32,
+
     /// Maximum number of reconnection attempts before giving up. 0 = retry
     /// forever.
     #[arg(long, default_value_t = 0)]
@@ -140,14 +159,15 @@ async fn main() -> Result<()> {
     let embedder: Arc<dyn Embedder> = build_embedder(&args).await?;
 
     // --- Build the frame source (once, reused across reconnects) -
-    let frames = if args.no_camera {
+    let (frames, recorder_rx) = if args.no_camera {
         info!("frame source: disabled (--no-camera)");
-        FrameSource::None
+        (FrameSource::None, None)
     } else {
         match camera::spawn(args.device_index) {
             Ok(handle) => {
                 info!(device = args.device_index, "webcam opened");
-                FrameSource::Cam(handle.rx)
+                let rx_for_recorder = handle.rx.clone();
+                (FrameSource::Cam(handle.rx), Some(rx_for_recorder))
             }
             Err(e) => {
                 bail!("camera open failed: {e}. Use --no-camera to run without a webcam.");
@@ -182,6 +202,36 @@ async fn main() -> Result<()> {
         info!("ctrl-c received, shutting down");
         let _ = shutdown_tx.send(true);
     });
+
+    // --- HLS recorder (optional) ---------------------------------
+    // Runs for the lifetime of the process (survives iroh reconnects).
+    let _recorder_task = if !args.no_record {
+        match recorder_rx {
+            Some(rx) => {
+                let cfg = RecorderConfig {
+                    camera_id: args.camera_id.clone(),
+                    recordings_dir: args.recordings_dir.clone(),
+                    fps: args.record_fps,
+                    segment_secs: args.record_segment_secs,
+                };
+                info!(
+                    camera = %cfg.camera_id,
+                    dir = %cfg.recordings_dir.display(),
+                    fps = cfg.fps,
+                    segment_secs = cfg.segment_secs,
+                    "HLS recorder: enabled"
+                );
+                Some(recorder::spawn(cfg, rx, shutdown_rx.clone()))
+            }
+            None => {
+                info!("HLS recorder: disabled (no camera)");
+                None
+            }
+        }
+    } else {
+        info!("HLS recorder: disabled (--no-record)");
+        None
+    };
 
     // --- Reconnect loop ------------------------------------------
     let mut attempt: u64 = 0;
