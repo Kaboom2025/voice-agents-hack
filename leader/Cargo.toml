@@ -9,6 +9,10 @@ build = "build.rs"
 name = "leader"
 path = "src/main.rs"
 
+[[example]]
+name = "chat"
+required-features = ["cactus"]
+
 [features]
 default = []
 cactus = []
@@ -32,3 +36,6 @@ tokio.workspace = true
 tower-http = { version = "0.5", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+dotenvy = "0.15"

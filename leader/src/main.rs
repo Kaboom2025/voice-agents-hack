@@ -717,44 +717,91 @@ struct HitJson {
     thumbnail_url: Option<String>,
 }
 
-/// Shared retrieval logic: embed the query text (if Gemini client is
-/// available), then search the store by vector similarity.
+/// Shared retrieval logic: embed the query text via local Cactus/Gemma
+/// (preferred) or Gemini API (fallback), then search the store by
+/// cosine similarity.
 async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredChunk>> {
     let now = now_ms();
 
-    // Embed the query text for vector search.
-    let query_embedding = if let Some(ref client) = state.gemini_embed {
-        match client.embed_text(&req.query).await {
-            Ok(vec) => {
-                info!(dim = vec.len(), "query text embedded");
-                Some(vec)
-            }
-            Err(e) => {
-                warn!(%e, "query text embedding failed, falling back to recency");
-                None
-            }
-        }
+    // Try to embed the query text for vector search.
+    // Priority: 1) local Cactus/Gemma  2) Gemini API  3) recency fallback
+    let query_embedding = embed_query(state, &req.query).await;
+
+    // When we have a query embedding, search ALL stored data (no time
+    // window) unless the user explicitly constrains it. Without an
+    // embedding we fall back to recency, so default to last 30 minutes
+    // to avoid dumping 10k chunks.
+    let (default_start, default_end) = if query_embedding.is_some() {
+        (None, None) // semantic search — scan everything
     } else {
-        None
+        (Some(now.saturating_sub(30 * 60 * 1000)), Some(now))
     };
 
     let filter = QueryFilter {
         query_embedding,
-        time_start_ms: req
-            .time_range
-            .as_ref()
-            .map(|tr| tr.from_ms)
-            .or(Some(now.saturating_sub(30 * 60 * 1000))),
-        time_end_ms: req
-            .time_range
-            .as_ref()
-            .map(|tr| tr.to_ms)
-            .or(Some(now)),
+        time_start_ms: req.time_range.as_ref().map(|tr| tr.from_ms).or(default_start),
+        time_end_ms: req.time_range.as_ref().map(|tr| tr.to_ms).or(default_end),
         camera_ids: req.cameras.clone(),
         top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
     };
 
     Ok(state.store.query(&filter))
+}
+
+/// Embed query text for vector search. Uses local Cactus model when
+/// available (no network round-trip), Gemini API as fallback.
+#[cfg(feature = "cactus")]
+async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+    // 1) Try local Cactus/Gemma text embedding (fast, no API key needed).
+    if let Some(ref model) = state.llm {
+        let model = Arc::clone(model);
+        let text = query.to_string();
+        match tokio::task::spawn_blocking(move || model.embed_text(&text, true)).await {
+            Ok(Ok(vec)) => {
+                info!(dim = vec.len(), "query embedded via local cactus/gemma");
+                return Some(vec);
+            }
+            Ok(Err(e)) => {
+                warn!(%e, "cactus text embed failed, trying gemini fallback");
+            }
+            Err(e) => {
+                warn!(%e, "cactus embed task panicked, trying gemini fallback");
+            }
+        }
+    }
+
+    // 2) Gemini API fallback.
+    if let Some(ref client) = state.gemini_embed {
+        match client.embed_text(query).await {
+            Ok(vec) => {
+                info!(dim = vec.len(), "query embedded via gemini API");
+                return Some(vec);
+            }
+            Err(e) => {
+                warn!(%e, "gemini query embedding also failed");
+            }
+        }
+    }
+
+    warn!("no embedding available — falling back to recency ranking");
+    None
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+    if let Some(ref client) = state.gemini_embed {
+        match client.embed_text(query).await {
+            Ok(vec) => {
+                info!(dim = vec.len(), "query embedded via gemini API");
+                return Some(vec);
+            }
+            Err(e) => {
+                warn!(%e, "query text embedding failed, falling back to recency");
+            }
+        }
+    }
+    warn!("no embedding available — falling back to recency ranking");
+    None
 }
 
 fn scored_to_hits(scored: &[store::ScoredChunk]) -> (Vec<HitJson>, Vec<CitationJson>) {
