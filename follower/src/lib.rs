@@ -9,5 +9,6 @@
 
 #[cfg(feature = "cactus")]
 pub mod cactus;
+pub mod audio;
 pub mod camera;
 pub mod embedder;

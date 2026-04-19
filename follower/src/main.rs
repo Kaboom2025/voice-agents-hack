@@ -1,4 +1,8 @@
-//! Follower CLI: webcam → Cactus (Gemma-4) embedding → iroh QUIC push.
+//! Follower CLI: webcam + mic → Cactus (Gemma-4) embedding → iroh QUIC push.
+//!
+//! PRD §5.1: each 5 s chunk samples K=4 evenly-spaced frames from the
+//! camera plus the audio segment from the microphone. The embedder
+//! produces a `[video_emb || audio_emb]` vector per chunk.
 //!
 //! Synthetic fallback kicks in automatically when either the model or
 //! the camera is unavailable (or when you pass `--synthetic`). That
@@ -16,10 +20,11 @@ use common::{
 };
 #[cfg(feature = "cactus")]
 use follower::cactus::CactusModel;
+use follower::audio;
 use follower::camera::{self, CapturedFrame};
 #[cfg(feature = "cactus")]
 use follower::embedder::CactusEmbedder;
-use follower::embedder::{Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
+use follower::embedder::{ChunkInput, Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
 use iroh::Endpoint;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -66,6 +71,14 @@ struct Args {
     /// when you want real embeddings but no camera hardware.
     #[arg(long, default_value_t = false)]
     no_camera: bool,
+
+    /// Skip the microphone. Useful in headless / no-audio environments.
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
+
+    /// Number of evenly-spaced frames to sample per chunk (PRD §5.1 K).
+    #[arg(long, default_value_t = 4)]
+    frames_per_chunk: usize,
 
     /// Directory where captured JPEG frames are written (one file per
     /// chunk, named `<camera-id>-<seq>.jpg`). Created if missing.
@@ -156,6 +169,23 @@ async fn main() -> Result<()> {
         }
     };
 
+    // --- Build the audio source ----------------------------------
+    let audio_buf = if args.no_audio {
+        info!("audio: disabled (--no-audio)");
+        None
+    } else {
+        match audio::start_capture() {
+            Ok(handle) => {
+                info!("audio capture started");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(error = %e, "mic open failed, continuing without audio");
+                None
+            }
+        }
+    };
+
     // --- Reader task: drain LeaderMsg, serve FrameRequests --------
     let frames_for_reader = frames.clone();
     let writer_for_reader = writer_tx.clone();
@@ -209,59 +239,90 @@ async fn main() -> Result<()> {
         }
     });
 
-    // --- Push loop ----------------------------------------------
-    let mut interval = tokio::time::interval(Duration::from_millis(args.interval_ms));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // --- Push loop: collect K frames over the chunk window, then embed --
+    let chunk_duration = Duration::from_millis(args.interval_ms);
+    let k = args.frames_per_chunk.max(1);
+    // Sub-interval: sample one frame every chunk_duration/K.
+    let frame_interval = chunk_duration / k as u32;
     let mut sent: u64 = 0;
     let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
 
     loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                // Grab a frame.
-                let frame = match frames.current() {
-                    Some(f) => f,
-                    None => {
-                        warn!("camera has no frame yet, waiting for next tick");
-                        continue;
+        // Collect K evenly-spaced frames across the chunk window.
+        let chunk_start_ms = now_ms();
+        let mut sampled_frames: Vec<CapturedFrame> = Vec::with_capacity(k);
+        let mut frame_ticker =
+            tokio::time::interval(frame_interval);
+        frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let mut aborted = false;
+        for _i in 0..k {
+            tokio::select! {
+                _ = frame_ticker.tick() => {
+                    if let Some(f) = frames.current() {
+                        sampled_frames.push(f);
                     }
-                };
-
-                // Embed on a blocking thread — Cactus on CPU is slow.
-                let seq = sent;
-                let emb = embedder.clone();
-                let out = match tokio::task::spawn_blocking(move || {
-                    emb.embed_frame(&frame, seq)
-                }).await {
-                    Ok(Ok(o)) => o,
-                    Ok(Err(e)) => { warn!(error = %e, "embed failed, skipping chunk"); continue; }
-                    Err(e) => { warn!(error = %e, "embed task panicked"); continue; }
-                };
-
-                let ts = now_ms();
-                let chunk = EmbeddingChunk {
-                    chunk_id: format!("{}-{}", args.camera_id, sent),
-                    camera_id: args.camera_id.clone(),
-                    start_ts_ms: ts,
-                    end_ts_ms: ts + args.interval_ms,
-                    embedding: out.embedding,
-                    caption: out.caption,
-                };
-                let dim = chunk.embedding.len();
-                if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
-                    warn!("writer channel closed; exiting");
-                    break;
                 }
-                sent += 1;
-                info!(sent, dim, "chunk sent");
-                if args.count != 0 && sent >= args.count {
+                _ = &mut stop => {
+                    aborted = true;
                     break;
                 }
             }
-            _ = &mut stop => {
-                info!("ctrl-c, stopping");
-                break;
-            }
+        }
+        if aborted {
+            info!("ctrl-c, stopping");
+            break;
+        }
+
+        if sampled_frames.is_empty() {
+            warn!("no frames captured this chunk, skipping");
+            continue;
+        }
+
+        // Drain the audio accumulated during this window.
+        let audio_samples = audio_buf
+            .as_ref()
+            .map(|h| h.buffer.drain())
+            .unwrap_or_default();
+
+        let input = ChunkInput {
+            frames: sampled_frames,
+            audio_samples,
+        };
+
+        // Embed on a blocking thread — Cactus on CPU is slow.
+        let seq = sent;
+        let emb = embedder.clone();
+        let out = match tokio::task::spawn_blocking(move || {
+            emb.embed_chunk(&input, seq)
+        }).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => { warn!(error = %e, "embed failed, skipping chunk"); continue; }
+            Err(e) => { warn!(error = %e, "embed task panicked"); continue; }
+        };
+
+        let ts = chunk_start_ms;
+        let chunk = EmbeddingChunk {
+            chunk_id: format!("{}-{}", args.camera_id, sent),
+            camera_id: args.camera_id.clone(),
+            start_ts_ms: ts,
+            end_ts_ms: now_ms(),
+            embedding: out.embedding,
+            video_dim: out.video_dim,
+            audio_dim: out.audio_dim,
+            caption: out.caption,
+        };
+        let dim = chunk.embedding.len();
+        let vd = chunk.video_dim;
+        let ad = chunk.audio_dim;
+        if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
+            warn!("writer channel closed; exiting");
+            break;
+        }
+        sent += 1;
+        info!(sent, dim, video_dim = vd, audio_dim = ad, "chunk sent");
+        if args.count != 0 && sent >= args.count {
+            break;
         }
     }
 

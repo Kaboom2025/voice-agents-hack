@@ -32,6 +32,11 @@ pub struct EmbeddingChunk {
     pub end_ts_ms: u64,
     /// Concatenated `[video || audio]` embedding, L2-normalized upstream.
     pub embedding: Vec<f32>,
+    /// Dimensionality of the video portion of the embedding vector.
+    pub video_dim: usize,
+    /// Dimensionality of the audio portion of the embedding vector (0 when
+    /// audio is unavailable). `embedding.len() == video_dim + audio_dim`.
+    pub audio_dim: usize,
     /// Optional one-sentence caption for hybrid retrieval.
     pub caption: Option<String>,
 }

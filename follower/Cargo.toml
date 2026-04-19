@@ -30,7 +30,9 @@ anyhow.workspace = true
 blake3 = "1"
 clap.workspace = true
 common = { path = "../common" }
+cpal = "0.15"
 dotenvy.workspace = true
+hound = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 iroh.workspace = true
 nokhwa = { version = "0.10", features = ["input-native"] }
@@ -38,3 +40,6 @@ rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[build-dependencies]
+dotenvy = "0.15"

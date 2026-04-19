@@ -352,6 +352,8 @@ async fn serve_stream(
                             camera = %chunk.camera_id,
                             chunk = %chunk.chunk_id,
                             dim = chunk.embedding.len(),
+                            video_dim = chunk.video_dim,
+                            audio_dim = chunk.audio_dim,
                             caption = chunk.caption.as_deref().unwrap_or(""),
                             "recv chunk",
                         );
