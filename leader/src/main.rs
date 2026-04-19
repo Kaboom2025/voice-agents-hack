@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
 
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
-        .discovery_n0()
+        .discovery_n0().alpns(vec![INGEST_ALPN.to_vec()])
         .bind()
         .await?;
 
