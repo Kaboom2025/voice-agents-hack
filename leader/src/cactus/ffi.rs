@@ -8,9 +8,8 @@ use std::os::raw::{c_char, c_int, c_void};
 pub type CactusModel = *mut c_void;
 
 #[allow(dead_code)]
-pub type CactusTokenCallback = Option<
-    unsafe extern "C" fn(token: *const c_char, token_id: u32, user_data: *mut c_void),
->;
+pub type CactusTokenCallback =
+    Option<unsafe extern "C" fn(token: *const c_char, token_id: u32, user_data: *mut c_void)>;
 
 unsafe extern "C" {
     pub fn cactus_init(

@@ -656,31 +656,20 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
 
     let handler = CactusQueryHandler::new(model);
     let now = now_ms();
-    let available_cameras: Vec<String> = state
-        .registry
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .keys()
-        .cloned()
-        .collect();
 
-    let parsed = match handler.parse_nl_query(&req.query, now, &available_cameras).await {
-        Ok(p) => p,
-        Err(e) => {
-            error!(%e, "parse_nl_query failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("parse error: {e}"))
-                .into_response();
-        }
-    };
-
+    // Skip the LLM-based query parser — Gemma 4 E2B on CPU spends minutes
+    // "thinking" before emitting JSON, which makes the UI hang. Use sane
+    // defaults: last 30 minutes, all cameras, top_k=20 (overridable via
+    // request body).
     let filter = QueryFilter {
-        time_start_ms: parsed.time_start_ms,
-        time_end_ms: parsed.time_end_ms.or(Some(now)),
-        camera_ids: req.cameras.clone().or(parsed.camera_ids),
-        top_k: req.top_k.map(|k| k as usize).unwrap_or(parsed.top_k),
+        time_start_ms: Some(now.saturating_sub(30 * 60 * 1000)),
+        time_end_ms: Some(now),
+        camera_ids: req.cameras.clone(),
+        top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
     };
     let chunks = state.store.query(&filter);
     let n_chunks = chunks.len();
+    info!(n_chunks, query = %req.query, "query: starting synthesis");
 
     let answer = match handler.synthesize_answer(&req.query, &chunks).await {
         Ok(a) => a,

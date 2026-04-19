@@ -6,8 +6,8 @@ use std::io::{self, BufRead, Write};
 use std::ptr;
 
 fn main() {
-    let model_path = std::env::var("CACTUS_MODEL_PATH")
-        .unwrap_or_else(|_| "weights/gemma-4-e2b-it".to_string());
+    let model_path =
+        std::env::var("CACTUS_MODEL_PATH").unwrap_or_else(|_| "weights/gemma-4-e2b-it".to_string());
 
     eprintln!("loading model from {model_path} …");
     let path_c = CString::new(model_path.as_str()).unwrap();

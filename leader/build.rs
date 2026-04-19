@@ -43,9 +43,7 @@ fn main() {
         .into_iter()
         .find(|d| d.join("libcactus.dylib").exists())
     else {
-        println!(
-            "cargo:warning=libcactus.dylib not found; set CACTUS_LIB_DIR or CACTUS_PREFIX"
-        );
+        println!("cargo:warning=libcactus.dylib not found; set CACTUS_LIB_DIR or CACTUS_PREFIX");
         return;
     };
 

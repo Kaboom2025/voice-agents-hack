@@ -1,8 +1,10 @@
 use std::io::Write;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use tracing::{debug, info, warn};
 
 use crate::cactus::CactusModel;
 use crate::store::StoredChunk;
@@ -33,6 +35,7 @@ impl CactusQueryHandler {
         let thirty_min_ago = now_ms.saturating_sub(30 * 60 * 1000);
         let prompt = format!(
             "Parse this security monitoring query and return ONLY a JSON object, nothing else.\n\
+            Do NOT think out loud, do NOT explain, do NOT use any reasoning channel.\n\
             Current time: {now_ms} ms since epoch.\n\
             Available cameras: [{camera_list}].\n\n\
             Query: \"{query}\"\n\n\
@@ -47,17 +50,24 @@ impl CactusQueryHandler {
 
         let messages = text_messages(&prompt);
         let model = Arc::clone(&self.model);
+        // Gemma 4 emits a thinking channel first; give it room to think and
+        // still produce the final JSON. 2048 tokens covers both.
+        info!(query = %query, "parse_nl_query: invoking gemma");
+        let t0 = Instant::now();
         let raw = tokio::task::spawn_blocking(move || {
-            model.complete(&messages, Some(r#"{"max_tokens":256}"#))
+            model.complete(&messages, Some(r#"{"max_tokens":2048}"#))
         })
         .await
         .context("parse task panicked")?
         .context("cactus parse failed")?;
+        info!(elapsed_ms = t0.elapsed().as_millis() as u64, "parse_nl_query: gemma returned");
 
         let response = extract_response(&raw);
+        debug!(response = %response, "parse_nl_query: raw response");
         let json_str = find_json(&response).unwrap_or(&response);
         let parsed: serde_json::Value = serde_json::from_str(json_str)
             .with_context(|| format!("gemma returned non-JSON: {response}"))?;
+        info!("parse_nl_query: parsed JSON ok");
 
         Ok(ParsedQuery {
             time_start_ms: parsed["time_start_ms"].as_u64(),
@@ -107,9 +117,11 @@ impl CactusQueryHandler {
             .collect();
 
         let content = format!(
-            "You are a security monitoring AI. Review the footage and answer concisely.\n\n\
+            "You are a security monitoring AI. Look at the frames and answer the question in ONE short sentence.\n\
+            Do NOT think out loud, do NOT explain your reasoning, do NOT use any reasoning channel — just give the final answer directly.\n\n\
             Observations:\n{}\n\n\
-            Question: {query}",
+            Question: {query}\n\
+            Answer:",
             observations.join("\n")
         );
 
@@ -120,6 +132,9 @@ impl CactusQueryHandler {
         };
 
         let model = Arc::clone(&self.model);
+        let n_images = image_paths.len();
+        info!(n_chunks = chunks.len(), n_images, "synthesize_answer: invoking gemma");
+        let t0 = Instant::now();
         let raw = tokio::task::spawn_blocking(move || {
             // Keep temp files alive until Cactus finishes reading them.
             let _keep = temp_files;
@@ -128,8 +143,13 @@ impl CactusQueryHandler {
         .await
         .context("synthesis task panicked")?
         .context("cactus synthesis failed")?;
+        info!(elapsed_ms = t0.elapsed().as_millis() as u64, "synthesize_answer: gemma returned");
 
-        Ok(extract_response(&raw).to_string())
+        let response = extract_response(&raw);
+        if response.trim().is_empty() {
+            warn!("synthesize_answer: empty response from gemma");
+        }
+        Ok(response)
     }
 }
 
@@ -151,10 +171,24 @@ fn vision_messages(content: &str, image_paths: &[String]) -> String {
 }
 
 fn extract_response(raw: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(raw)
+    let body = serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|v| v["response"].as_str().map(String::from))
-        .unwrap_or_else(|| raw.to_string())
+        .unwrap_or_else(|| raw.to_string());
+    strip_thinking(&body).to_string()
+}
+
+/// Gemma 4 emits `<|channel>thought ... <|channel>final` style preambles.
+/// Return the substring after the last `<|channel>` marker so callers see
+/// only the final-answer text.
+fn strip_thinking(text: &str) -> &str {
+    if let Some(idx) = text.rfind("<|channel>") {
+        let rest = &text[idx..];
+        if let Some(nl) = rest.find('\n') {
+            return rest[nl + 1..].trim_start();
+        }
+    }
+    text
 }
 
 fn find_json(text: &str) -> Option<&str> {

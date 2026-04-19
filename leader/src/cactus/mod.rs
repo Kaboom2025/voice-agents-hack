@@ -50,8 +50,7 @@ impl CactusModel {
 
         // SAFETY: both pointers are valid for the duration of the call;
         // Cactus copies the strings internally.
-        let handle =
-            unsafe { ffi::cactus_init(model_cstr.as_ptr(), ptr::null(), false) };
+        let handle = unsafe { ffi::cactus_init(model_cstr.as_ptr(), ptr::null(), false) };
 
         if handle.is_null() {
             return Err(anyhow!(
@@ -73,9 +72,7 @@ impl CactusModel {
             .map(CString::new)
             .transpose()
             .context("options contain NUL byte")?;
-        let opts_ptr = opts_c
-            .as_ref()
-            .map_or(ptr::null(), |c| c.as_ptr());
+        let opts_ptr = opts_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
 
         let mut buf = vec![0 as c_char; RESPONSE_BUF_BYTES];
 
