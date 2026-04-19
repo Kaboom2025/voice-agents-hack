@@ -24,10 +24,14 @@ use tracing::{error, info, warn};
 struct Args {
     /// Path to a file holding the leader's 32-byte secret key as hex.
     /// Created with mode 0600 on first run if missing. Pin this file to keep
-    /// your node id (and therefore the identity inside the ticket) stable
-    /// across restarts.
+    /// your node id stable across restarts.
     #[arg(long, env = "LEADER_KEY_FILE", default_value = ".leader.key")]
     key_file: PathBuf,
+
+    /// Path where the dialable ticket is written on startup. Followers in the
+    /// same directory will pick it up automatically.
+    #[arg(long, env = "LEADER_TICKET_FILE", default_value = ".leader.ticket")]
+    ticket_file: PathBuf,
 
     /// Filter logs (default `info`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
@@ -60,19 +64,45 @@ async fn main() -> Result<()> {
     let addr = endpoint.node_addr().initialized().await;
 
     let ticket = Ticket::new(addr);
+    let ticket_str = ticket.to_string();
+    std::fs::write(&args.ticket_file, &ticket_str)
+        .with_context(|| format!("write ticket file {}", args.ticket_file.display()))?;
+
     println!("\n  leader ready");
     println!("  endpoint id: {id}");
-    println!("  ticket (share with followers):\n\n{ticket}\n");
+    println!("  ticket file: {}", args.ticket_file.display());
+    println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
 
     let handler = IngestHandler::default();
     let router = Router::builder(endpoint)
         .accept(INGEST_ALPN, handler)
         .spawn();
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown().await?;
     info!("shutting down");
+    let _ = std::fs::remove_file(&args.ticket_file);
     router.shutdown().await?;
     Ok(())
+}
+
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM so the ticket file gets cleaned up
+/// regardless of how the process is asked to exit.
+async fn wait_for_shutdown() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
 }
 
 /// Load a hex-encoded 32-byte secret key from `path`, or generate a fresh one

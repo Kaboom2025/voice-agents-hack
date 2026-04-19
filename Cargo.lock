@@ -884,6 +884,7 @@ dependencies = [
  "anyhow",
  "clap",
  "common",
+ "dotenvy",
  "iroh",
  "rand 0.9.4",
  "tokio",

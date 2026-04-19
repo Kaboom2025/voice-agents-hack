@@ -2,9 +2,12 @@
 //! `EmbeddingChunk`s on a tick. Replace `make_chunk` with the real Cactus +
 //! Gemma embedding output once the capture pipeline is wired up.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use common::{EmbeddingChunk, FollowerMsg, INGEST_ALPN, LeaderMsg, Ticket, read_frame, write_frame};
 use iroh::Endpoint;
@@ -14,8 +17,12 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(about = "iroh follower: streams embedding chunks to the leader")]
 struct Args {
-    /// Ticket printed by the leader.
-    ticket: String,
+    /// Ticket string. If omitted, the follower reads it from `--ticket-file`.
+    ticket: Option<String>,
+
+    /// Path to a ticket file (the leader writes one on startup).
+    #[arg(long, env = "LEADER_TICKET_FILE", default_value = ".leader.ticket")]
+    ticket_file: PathBuf,
 
     /// Logical camera id (any string unique per follower).
     #[arg(long, default_value = "cam-0")]
@@ -39,13 +46,32 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pull values from `.env` if present; real env always wins.
+    let _ = dotenvy::dotenv();
+
     let args = Args::parse();
     tracing_subscriber::fmt()
         .with_env_filter(&args.log)
         .with_target(false)
         .init();
 
-    let ticket: Ticket = args.ticket.parse().context("parse ticket")?;
+    let ticket_str = match args.ticket {
+        Some(t) => t,
+        None => std::fs::read_to_string(&args.ticket_file)
+            .with_context(|| {
+                format!(
+                    "no ticket given and ticket file {} not readable (is the leader running?)",
+                    args.ticket_file.display()
+                )
+            })?
+            .trim()
+            .to_string(),
+    };
+    if ticket_str.is_empty() {
+        bail!("ticket is empty");
+    }
+
+    let ticket: Ticket = ticket_str.parse().context("parse ticket")?;
     info!(leader = %ticket.leader.node_id, "dialing leader");
 
     let endpoint = Endpoint::builder()

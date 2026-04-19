@@ -4,4 +4,5 @@ Cargo.lock.bak
 
 .env
 .leader.key
+.leader.ticket
 *.key

@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 common = { path = "../common" }
+dotenvy.workspace = true
 iroh.workspace = true
 rand.workspace = true
 tokio.workspace = true
