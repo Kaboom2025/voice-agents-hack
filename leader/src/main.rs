@@ -310,6 +310,18 @@ async fn serve_stream(
     remote: String,
 ) -> Result<()> {
     let (req_tx, mut req_rx) = mpsc::channel::<FrameReq>(64);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<LeaderMsg>(128);
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if let Err(e) = write_frame(&mut send, &msg).await {
+                error!(%e, "writer task send failed");
+                break;
+            }
+        }
+        let _ = send.finish();
+    });
+
     let mut pending: HashMap<u64, oneshot::Sender<FrameOutcome>> = HashMap::new();
     let mut camera_id: Option<String> = None;
     let mut entry: Option<CameraEntry> = None;
@@ -358,8 +370,7 @@ async fn serve_stream(
                             "recv chunk",
                         );
                         let ack = LeaderMsg::Ack { chunk_id: chunk.chunk_id };
-                        if let Err(e) = write_frame(&mut send, &ack).await {
-                            error!(%e, "ack write failed");
+                        if outbound_tx.send(ack).await.is_err() {
                             break;
                         }
                     }
@@ -391,16 +402,14 @@ async fn serve_stream(
             // Outbound: HTTP layer asked for a frame.
             Some(req) = req_rx.recv() => {
                 pending.insert(req.req_id, req.response_tx);
-                if let Err(e) = write_frame(&mut send, &LeaderMsg::FrameRequest { req_id: req.req_id }).await {
-                    warn!(%e, "frame request write failed");
-                    if let Some(tx) = pending.remove(&req.req_id) {
-                        let _ = tx.send(FrameOutcome::Err(format!("write failed: {e}")));
-                    }
+                if outbound_tx.send(LeaderMsg::FrameRequest { req_id: req.req_id }).await.is_err() {
                     break;
                 }
             }
         }
     }
+
+    writer_task.abort();
 
     // Cleanup: drop the registration so HTTP requests stop landing here, and
     // cancel any pending oneshots so callers see an error instead of hanging.
