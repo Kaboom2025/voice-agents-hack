@@ -54,13 +54,11 @@ impl GeminiQueryClient {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json"}
         });
-        let url = format!(
-            "{GEMINI_BASE}/gemini-2.0-flash:generateContent?key={}",
-            self.api_key
-        );
+        let url = format!("{GEMINI_BASE}/gemini-2.0-flash:generateContent");
         let resp: GeminiResponse = self
             .http
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await
@@ -98,8 +96,9 @@ impl GeminiQueryClient {
             "text": "You are a security monitoring AI. Review the camera footage frames below and answer the security question."
         })];
 
-        for sc in chunks.iter().filter(|sc| sc.chunk.representative_jpeg.is_some()).take(10) {
-            let jpeg = sc.chunk.representative_jpeg.as_ref().unwrap();
+        for (sc, jpeg) in chunks.iter().filter_map(|sc| {
+            sc.chunk.representative_jpeg.as_ref().map(|jpeg| (sc, jpeg))
+        }).take(10) {
             parts.push(json!({
                 "inline_data": {
                     "mime_type": "image/jpeg",
@@ -139,13 +138,11 @@ impl GeminiQueryClient {
         }));
 
         let body = json!({ "contents": [{"parts": parts}] });
-        let url = format!(
-            "{GEMINI_BASE}/gemini-2.0-flash:generateContent?key={}",
-            self.api_key
-        );
+        let url = format!("{GEMINI_BASE}/gemini-2.0-flash:generateContent");
         let resp: GeminiResponse = self
             .http
             .post(&url)
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await
