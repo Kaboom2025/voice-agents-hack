@@ -108,7 +108,12 @@ async fn main() -> Result<()> {
     println!("  endpoint id: {id}");
     println!("  ticket file: {}", args.ticket_file.display());
     println!("  http on:     http://{}", args.http_addr);
-    println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
+    println!("  ticket:\n\n{ticket_str}\n");
+    println!("  == HOW TO CONNECT ==");
+    println!("  1. From this computer (Local):");
+    println!("     cargo run --release -p follower -- --camera-id cam-local");
+    println!("  2. From another computer (Remote):");
+    println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
 
     // Shared state used by both the iroh ingest handler and the HTTP server.
     let app_state = AppState {
@@ -315,7 +320,7 @@ async fn serve_stream(
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
             if let Err(e) = write_frame(&mut send, &msg).await {
-                error!(%e, "writer task send failed");
+                error!(%e, "writer task send failed - network connection might have dropped concurrently");
                 break;
             }
         }
@@ -332,8 +337,14 @@ async fn serve_stream(
             msg = read_frame::<_, FollowerMsg>(&mut recv) => {
                 let msg = match msg {
                     Ok(Some(m)) => m,
-                    Ok(None) => break,
-                    Err(e) => { warn!(%e, "stream read failed"); break; }
+                    Ok(None) => {
+                        debug!("clean EOF from follower stream");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(%e, "stream read failed - remote connection likely severed or frame excessively large");
+                        break;
+                    }
                 };
                 match msg {
                     FollowerMsg::Hello { camera_id: cid } => {
