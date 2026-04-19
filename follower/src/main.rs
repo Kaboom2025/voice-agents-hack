@@ -27,7 +27,7 @@ use follower::embedder::CactusEmbedder;
 use follower::embedder::{ChunkInput, Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
 use follower::gemini_embedder::{GeminiEmbedder, GeminiVideoEmbedder};
 use iroh::Endpoint;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
@@ -169,10 +169,22 @@ async fn main() -> Result<()> {
     // --- iroh endpoint (once, reused across reconnects) ----------
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
 
+    // --- Graceful shutdown on ctrl-c -----------------------------
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("ctrl-c received, shutting down");
+        let _ = shutdown_tx.send(true);
+    });
+
     // --- Reconnect loop ------------------------------------------
     let mut attempt: u64 = 0;
     let mut total_sent: u64 = 0;
     loop {
+        if *shutdown_rx.borrow() {
+            info!("shutdown requested, stopping");
+            break;
+        }
         attempt += 1;
         if args.max_retries > 0 && attempt > args.max_retries {
             warn!(attempts = attempt - 1, "max retries exceeded, giving up");
@@ -181,15 +193,31 @@ async fn main() -> Result<()> {
         if attempt > 1 {
             let backoff = Duration::from_secs((attempt - 1).min(30));
             info!(attempt, backoff_secs = backoff.as_secs(), "reconnecting");
-            tokio::time::sleep(backoff).await;
+            let mut rx = shutdown_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = wait_for_shutdown(&mut rx) => {
+                    info!("ctrl-c during backoff, stopping");
+                    break;
+                }
+            }
         }
 
         info!(leader = %ticket.leader.node_id, attempt, "dialing leader");
-        let conn = match endpoint.connect(ticket.leader.clone(), INGEST_ALPN).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, "connect failed");
-                continue;
+        let mut rx = shutdown_rx.clone();
+        let conn = tokio::select! {
+            result = endpoint.connect(ticket.leader.clone(), INGEST_ALPN) => {
+                match result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "connect failed");
+                        continue;
+                    }
+                }
+            }
+            _ = wait_for_shutdown(&mut rx) => {
+                info!("ctrl-c during connect, stopping");
+                break;
             }
         };
         info!("connected");
@@ -201,6 +229,7 @@ async fn main() -> Result<()> {
             &frames,
             audio_buf.as_ref(),
             &mut total_sent,
+            shutdown_rx.clone(),
         )
         .await
         {
@@ -240,6 +269,7 @@ async fn run_session(
     frames: &FrameSource,
     audio_buf: Option<&audio::AudioHandle>,
     total_sent: &mut u64,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<SessionEnd> {
     let (mut send, mut recv) = conn.open_bi().await.context("open bidi stream")?;
 
@@ -320,7 +350,6 @@ async fn run_session(
     let k = args.frames_per_chunk.max(1);
     let frame_interval = chunk_duration / k as u32;
     let mut sent_this_session: u64 = 0;
-    let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
 
     let result = loop {
         // Collect K evenly-spaced frames across the chunk window.
@@ -337,7 +366,7 @@ async fn run_session(
                         sampled_frames.push(f);
                     }
                 }
-                _ = &mut stop => {
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
                     aborted = true;
                     break;
                 }
@@ -370,6 +399,11 @@ async fn run_session(
         // Drain the audio accumulated during this window.
         let audio_samples = audio_buf.map(|h| h.buffer.drain()).unwrap_or_default();
 
+        // Capture end timestamp NOW, before the (potentially slow) embed
+        // call, so the chunk's time range reflects the actual capture
+        // window rather than being inflated by embedding latency.
+        let chunk_end_ms = now_ms();
+
         let input = ChunkInput {
             frames: sampled_frames.clone(),
             audio_samples,
@@ -389,7 +423,7 @@ async fn run_session(
                     continue;
                 }
             },
-            _ = &mut stop => {
+            _ = wait_for_shutdown(&mut shutdown_rx) => {
                 break SessionEnd::CtrlC;
             }
         };
@@ -399,7 +433,7 @@ async fn run_session(
             chunk_id: format!("{}-{}", args.camera_id, *total_sent),
             camera_id: args.camera_id.clone(),
             start_ts_ms: ts,
-            end_ts_ms: now_ms(),
+            end_ts_ms: chunk_end_ms,
             embedding: out.embedding,
             video_dim: out.video_dim,
             audio_dim: out.audio_dim,
@@ -432,6 +466,15 @@ async fn run_session(
     let _ = writer_task.await;
     reader_task.abort();
     Ok(result)
+}
+
+/// Resolves when the shutdown watch channel becomes `true`.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return; // sender dropped — treat as shutdown
+        }
+    }
 }
 
 fn now_ms() -> u64 {

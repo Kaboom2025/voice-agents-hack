@@ -8,3 +8,6 @@ Cargo.lock.bak
 *.key
 /weights/
 .venv/
+
+recordings/
+frames/

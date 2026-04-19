@@ -2333,6 +2333,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "common",
  "data-encoding",
@@ -2340,6 +2341,7 @@ dependencies = [
  "iroh",
  "rand 0.9.4",
  "rand_core 0.6.4",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

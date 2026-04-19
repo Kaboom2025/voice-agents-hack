@@ -13,6 +13,7 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+mod gemini;
 #[cfg(feature = "cactus")]
 mod query;
 mod store;
@@ -48,6 +49,7 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "cactus")]
 use crate::cactus::CactusModel;
+use crate::gemini::GeminiEmbedClient;
 #[cfg(feature = "cactus")]
 use crate::query::CactusQueryHandler;
 use crate::store::{EmbeddingStore, QueryFilter};
@@ -93,6 +95,12 @@ struct Args {
     /// Max embedding chunks to retain in memory (older chunks evicted first).
     #[arg(long, env = "STORE_MAX_SIZE", default_value_t = 10_000)]
     store_max_size: usize,
+
+    /// Gemini API key for embedding user queries. Required for vector
+    /// similarity search. Without it, queries fall back to recency-based
+    /// retrieval.
+    #[arg(long, env = "GEMINI_API_KEY")]
+    gemini_api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -143,6 +151,15 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(EmbeddingStore::new(args.store_max_size));
 
+    // Build the Gemini embedding client for query-time text embedding.
+    let gemini_embed = args.gemini_api_key.as_ref().map(|key| {
+        info!("gemini query embedding enabled");
+        Arc::new(GeminiEmbedClient::new(key.clone()))
+    });
+    if gemini_embed.is_none() {
+        warn!("no GEMINI_API_KEY — queries will use recency ranking, not vector similarity");
+    }
+
     // Load Gemma up front. If it fails, log and keep serving — the rest
     // of the leader (camera registry, live snapshots) still works.
     #[cfg(feature = "cactus")]
@@ -172,6 +189,7 @@ async fn main() -> Result<()> {
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
         store,
+        gemini_embed,
         #[cfg(feature = "cactus")]
         llm,
     };
@@ -297,6 +315,9 @@ struct AppState {
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
     store: Arc<EmbeddingStore>,
+    /// Gemini client for embedding query text. `None` when no API key is
+    /// set — queries fall back to recency ranking.
+    gemini_embed: Option<Arc<GeminiEmbedClient>>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
 }
@@ -524,6 +545,7 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
     let app = Router::new()
         .route("/api/cameras", get(list_cameras))
         .route("/api/live/:camera_id", get(live_jpg))
+        .route("/api/thumbnail/:chunk_id", get(thumbnail))
         .route("/api/query", post(query))
         .layer(cors)
         .with_state(state);
@@ -627,7 +649,30 @@ async fn live_jpg(State(state): State<AppState>, AxPath(camera_id): AxPath<Strin
     }
 }
 
-// ──────────────────────────── query (LLM) ────────────────────────────
+// ──────────────────────────── thumbnail ──────────────────────────────
+
+/// Serves the representative JPEG thumbnail stored with each chunk.
+async fn thumbnail(
+    State(state): State<AppState>,
+    AxPath(chunk_id): AxPath<String>,
+) -> Response {
+    match state.store.get_by_id(&chunk_id) {
+        Some(sc) => match sc.chunk.representative_jpeg {
+            Some(jpeg) => (
+                [
+                    (header::CONTENT_TYPE, "image/jpeg"),
+                    (header::CACHE_CONTROL, "public, max-age=3600, immutable"),
+                ],
+                jpeg,
+            )
+                .into_response(),
+            None => (StatusCode::NOT_FOUND, "chunk has no thumbnail").into_response(),
+        },
+        None => (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+    }
+}
+
+// ──────────────────────────── query (RAG) ────────────────────────────
 
 #[derive(Deserialize)]
 struct QueryReq {
@@ -635,66 +680,183 @@ struct QueryReq {
     #[serde(default)]
     cameras: Option<Vec<String>>,
     #[serde(default)]
+    time_range: Option<TimeRange>,
+    #[serde(default)]
     top_k: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct TimeRange {
+    from_ms: u64,
+    to_ms: u64,
 }
 
 #[derive(Serialize)]
 struct QueryResp {
     answer: String,
-    citations: Vec<serde_json::Value>,
-    hits: Vec<serde_json::Value>,
+    citations: Vec<CitationJson>,
+    hits: Vec<HitJson>,
+}
+
+#[derive(Serialize)]
+struct CitationJson {
+    camera_id: String,
+    chunk_id: String,
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+}
+
+#[derive(Serialize)]
+struct HitJson {
+    chunk_id: String,
+    camera_id: String,
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+    caption: Option<String>,
+    score: f32,
+    thumbnail_url: Option<String>,
+}
+
+/// Shared retrieval logic: embed the query text (if Gemini client is
+/// available), then search the store by vector similarity.
+async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredChunk>> {
+    let now = now_ms();
+
+    // Embed the query text for vector search.
+    let query_embedding = if let Some(ref client) = state.gemini_embed {
+        match client.embed_text(&req.query).await {
+            Ok(vec) => {
+                info!(dim = vec.len(), "query text embedded");
+                Some(vec)
+            }
+            Err(e) => {
+                warn!(%e, "query text embedding failed, falling back to recency");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let filter = QueryFilter {
+        query_embedding,
+        time_start_ms: req
+            .time_range
+            .as_ref()
+            .map(|tr| tr.from_ms)
+            .or(Some(now.saturating_sub(30 * 60 * 1000))),
+        time_end_ms: req
+            .time_range
+            .as_ref()
+            .map(|tr| tr.to_ms)
+            .or(Some(now)),
+        camera_ids: req.cameras.clone(),
+        top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
+    };
+
+    Ok(state.store.query(&filter))
+}
+
+fn scored_to_hits(scored: &[store::ScoredChunk]) -> (Vec<HitJson>, Vec<CitationJson>) {
+    let hits: Vec<HitJson> = scored
+        .iter()
+        .map(|sc| {
+            let c = &sc.chunk.chunk;
+            HitJson {
+                chunk_id: c.chunk_id.clone(),
+                camera_id: c.camera_id.clone(),
+                start_ts_ms: c.start_ts_ms,
+                end_ts_ms: c.end_ts_ms,
+                caption: c.caption.clone(),
+                score: sc.score,
+                thumbnail_url: c
+                    .representative_jpeg
+                    .as_ref()
+                    .map(|_| format!("/api/thumbnail/{}", c.chunk_id)),
+            }
+        })
+        .collect();
+
+    let citations: Vec<CitationJson> = scored
+        .iter()
+        .filter(|sc| sc.score > 0.3 || sc.score == 0.0)
+        .map(|sc| {
+            let c = &sc.chunk.chunk;
+            CitationJson {
+                camera_id: c.camera_id.clone(),
+                chunk_id: c.chunk_id.clone(),
+                start_ts_ms: c.start_ts_ms,
+                end_ts_ms: c.end_ts_ms,
+            }
+        })
+        .collect();
+
+    (hits, citations)
 }
 
 #[cfg(feature = "cactus")]
 async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
-    let Some(model) = state.llm.clone() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "gemma model not loaded").into_response();
-    };
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
 
-    let handler = CactusQueryHandler::new(model);
-    let now = now_ms();
-
-    // Skip the LLM-based query parser — Gemma 4 E2B on CPU spends minutes
-    // "thinking" before emitting JSON, which makes the UI hang. Use sane
-    // defaults: last 30 minutes, all cameras, top_k=20 (overridable via
-    // request body).
-    let filter = QueryFilter {
-        time_start_ms: Some(now.saturating_sub(30 * 60 * 1000)),
-        time_end_ms: Some(now),
-        camera_ids: req.cameras.clone(),
-        top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
-    };
-    let chunks = state.store.query(&filter);
-    let n_chunks = chunks.len();
-    info!(n_chunks, query = %req.query, "query: starting synthesis");
-
-    let answer = match handler.synthesize_answer(&req.query, &chunks).await {
-        Ok(a) => a,
+    // Step 1: Retrieve by vector similarity (or recency fallback).
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
         Err(e) => {
-            error!(%e, "synthesize_answer failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("synthesis error: {e}"))
+            error!(%e, "retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
                 .into_response();
         }
     };
+    let n_chunks = scored.len();
+    let (hits, citations) = scored_to_hits(&scored);
+    info!(n_chunks, query = %req.query, "query: retrieval complete");
+
+    // Step 2: LLM synthesis (if cactus model available).
+    let stored: Vec<store::StoredChunk> = scored.iter().map(|sc| sc.chunk.clone()).collect();
+    let answer = if let Some(model) = state.llm.clone() {
+        let handler = CactusQueryHandler::new(model);
+        match handler.synthesize_answer(&req.query, &stored).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%e, "LLM synthesis failed, returning retrieval-only results");
+                format!("Found {} relevant chunks but LLM synthesis failed.", n_chunks)
+            }
+        }
+    } else {
+        format!("Found {} relevant chunks (LLM not loaded for synthesis).", n_chunks)
+    };
 
     info!(n_chunks, "query answered");
-    Json(QueryResp { answer, citations: Vec::new(), hits: Vec::new() }).into_response()
+    Json(QueryResp { answer, citations, hits }).into_response()
 }
 
 #[cfg(not(feature = "cactus"))]
-async fn query(_state: State<AppState>, Json(req): Json<QueryReq>) -> Response {
+async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
-    Json(QueryResp {
-        answer: "Build with --features cactus to enable RAG query support.".into(),
-        citations: Vec::new(),
-        hits: Vec::new(),
-    })
-    .into_response()
+
+    // Retrieve by vector similarity (or recency fallback).
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(%e, "retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
+                .into_response();
+        }
+    };
+    let n_chunks = scored.len();
+    let (hits, citations) = scored_to_hits(&scored);
+    info!(n_chunks, query = %req.query, "query: retrieval complete (no LLM)");
+
+    let answer = format!(
+        "Found {} relevant chunks. Build with --features cactus for LLM-synthesized answers.",
+        n_chunks
+    );
+
+    Json(QueryResp { answer, citations, hits }).into_response()
 }
 
 #[cfg(test)]
@@ -723,6 +885,7 @@ mod tests {
         store.push(make_chunk("cam-0", 1000));
         store.push(make_chunk("cam-0", 6000));
         let results = store.query(&QueryFilter {
+            query_embedding: None,
             time_start_ms: None,
             time_end_ms: None,
             camera_ids: None,

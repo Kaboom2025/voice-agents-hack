@@ -16,6 +16,7 @@ cactus = []
 [dependencies]
 anyhow.workspace = true
 axum = "0.7"
+base64 = "0.22"
 clap.workspace = true
 common = { path = "../common" }
 data-encoding.workspace = true
@@ -23,6 +24,7 @@ dotenvy.workspace = true
 iroh.workspace = true
 rand.workspace = true
 rand_core_06.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 serde_json.workspace = true
