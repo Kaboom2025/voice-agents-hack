@@ -5,6 +5,13 @@ pub const GEMINI_EMBED_MODEL: &str = "models/gemini-embedding-2-preview";
 pub const GEMINI_EMBED_DIM: usize = 3072;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
+/// Generic media part for embedding requests (image, audio, etc.)
+#[derive(Clone)]
+pub struct MediaPart {
+    pub mime_type: String,
+    pub data_b64: String,
+}
+
 #[derive(Serialize)]
 struct EmbedRequest {
     model: String,
@@ -50,13 +57,13 @@ impl GeminiEmbedClient {
         }
     }
 
-    pub async fn embed(&self, jpeg_b64_frames: Vec<String>) -> Result<Vec<f32>> {
-        let parts: Vec<Part> = jpeg_b64_frames
+    pub async fn embed(&self, media_parts: Vec<MediaPart>) -> Result<Vec<f32>> {
+        let parts: Vec<Part> = media_parts
             .into_iter()
-            .map(|data| Part {
+            .map(|part| Part {
                 inline_data: InlineData {
-                    mime_type: "image/jpeg".into(),
-                    data,
+                    mime_type: part.mime_type,
+                    data: part.data_b64,
                 },
             })
             .collect();
@@ -135,6 +142,34 @@ mod tests {
         assert!(s.contains("def"));
     }
 
+    #[test]
+    fn serialise_embed_request_mixed_media() {
+        let req = EmbedRequest {
+            model: GEMINI_EMBED_MODEL.to_string(),
+            content: Content {
+                parts: vec![
+                    Part {
+                        inline_data: InlineData {
+                            mime_type: "image/jpeg".into(),
+                            data: "frame_data".into(),
+                        },
+                    },
+                    Part {
+                        inline_data: InlineData {
+                            mime_type: "audio/wav".into(),
+                            data: "audio_data".into(),
+                        },
+                    },
+                ],
+            },
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("image/jpeg"));
+        assert!(s.contains("audio/wav"));
+        assert!(s.contains("frame_data"));
+        assert!(s.contains("audio_data"));
+    }
+
     #[tokio::test]
     async fn live_embed_single_frame() {
         let Ok(key) = std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("gemini_api_key"))
@@ -144,7 +179,12 @@ mod tests {
         };
         let jpeg_b64 = minimal_red_jpeg_b64();
         let client = GeminiEmbedClient::new(key);
-        let result = client.embed(vec![jpeg_b64]).await;
+        let result = client
+            .embed(vec![MediaPart {
+                mime_type: "image/jpeg".to_string(),
+                data_b64: jpeg_b64,
+            }])
+            .await;
         match result {
             Ok(v) => {
                 println!("embedding dim = {}", v.len());
