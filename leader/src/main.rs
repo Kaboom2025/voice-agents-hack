@@ -13,6 +13,7 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+mod query;
 mod store;
 
 use std::{
