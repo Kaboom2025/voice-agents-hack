@@ -295,7 +295,7 @@ fn build_video_embedder(args: &Args) -> Arc<dyn VideoEmbedder> {
         return Arc::new(SyntheticVideoEmbedder::new(GEMINI_EMBED_DIM));
     }
     if let Some(ref key) = args.gemini_api_key {
-        info!("video embedder: GeminiVideoEmbedder (gemini-embedding-exp-03-07)");
+        info!("video embedder: GeminiVideoEmbedder (gemini-embedding-2-preview)");
         return Arc::new(GeminiVideoEmbedder::new(key.clone()));
     }
     info!("video embedder: synthetic (no GEMINI_API_KEY)");

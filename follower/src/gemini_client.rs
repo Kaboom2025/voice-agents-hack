@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub const GEMINI_EMBED_MODEL: &str = "models/gemini-embedding-exp-03-07";
+pub const GEMINI_EMBED_MODEL: &str = "models/gemini-embedding-2-preview";
 pub const GEMINI_EMBED_DIM: usize = 3072;
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
 
