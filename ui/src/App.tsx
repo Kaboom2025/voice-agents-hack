@@ -11,6 +11,7 @@ import { CameraScope, scopeToIds, type Scope } from "./components/CameraScope";
 import { LiveGrid } from "./components/LiveGrid";
 import { VoiceBar } from "./components/VoiceBar";
 import { ResultCard } from "./components/ResultCard";
+import { ClipPopup } from "./components/ClipPopup";
 import { ImageSearch } from "./tabs/ImageSearch";
 
 type View = "ask" | "image-search";
@@ -34,6 +35,7 @@ export default function App() {
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [last, setLast] = useState<AskState | null>(null);
   const [view, setView] = useState<View>("ask");
+  const [popupHitId, setPopupHitId] = useState<string | null>(null);
 
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const ids = scopeToIds(scope, cameras);
@@ -155,7 +157,7 @@ export default function App() {
             {hasHits ? (
               <div className={`grid ${hitsGridCols(hits.length)} gap-4`}>
                 {hits.map((h, i) => (
-                  <ResultCard key={h.chunk_id} hit={h} rank={i + 1} />
+                  <ResultCard key={h.chunk_id} hit={h} rank={i + 1} onOpen={() => setPopupHitId(h.chunk_id)} />
                 ))}
               </div>
             ) : (
@@ -221,6 +223,13 @@ export default function App() {
           </section>
         )}
       </main>
+      )}
+      {popupHitId && last && (
+        <ClipPopup
+          hits={last.hits}
+          initialId={popupHitId}
+          onClose={() => setPopupHitId(null)}
+        />
       )}
     </div>
   );

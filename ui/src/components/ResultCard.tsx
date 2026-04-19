@@ -1,13 +1,17 @@
 import { type ClipHit } from "../api";
 
-export function ResultCard({ hit, rank }: { hit: ClipHit; rank?: number }) {
+export function ResultCard({ hit, rank, onOpen }: { hit: ClipHit; rank?: number; onOpen?: () => void }) {
   const start = new Date(hit.start_ts_ms);
   const scorePct = Math.round(hit.score * 100);
   const scoreColor =
     scorePct >= 70 ? "bg-emerald-500" : scorePct >= 40 ? "bg-amber-500" : "bg-slate-400";
 
   return (
-    <div className="group relative glass rounded-2xl overflow-hidden hover:shadow-glass hover:-translate-y-0.5 transition-all">
+    <div
+      className="group relative glass rounded-2xl overflow-hidden hover:shadow-glass hover:-translate-y-0.5 transition-all cursor-pointer"
+      onClick={onOpen}
+      role={onOpen ? "button" : undefined}
+    >
       {/* Thumbnail */}
       <div className="aspect-video bg-slate-900 relative">
         {hit.thumbnail_url ? (
