@@ -1166,6 +1166,8 @@ name = "follower"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64",
  "blake3",
  "clap",
  "common",
@@ -1174,6 +1176,9 @@ dependencies = [
  "iroh",
  "nokhwa",
  "rand 0.9.4",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

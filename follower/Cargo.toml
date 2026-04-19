@@ -27,6 +27,8 @@ cactus = []
 
 [dependencies]
 anyhow.workspace = true
+async-trait = "0.1"
+base64 = "0.22"
 blake3 = "1"
 clap.workspace = true
 common = { path = "../common" }
@@ -35,6 +37,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 iroh.workspace = true
 nokhwa = { version = "0.10", features = ["input-native"] }
 rand.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
