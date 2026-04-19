@@ -103,6 +103,7 @@ where
     }
     w.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     w.write_all(&bytes).await?;
+    w.flush().await?;
     Ok(())
 }
 

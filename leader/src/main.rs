@@ -60,7 +60,11 @@ async fn main() -> Result<()> {
     let id = endpoint.node_id();
     info!(node_id = %id, key_file = %args.key_file.display(), "leader endpoint bound");
 
-    // Wait until our address (relay/direct) is known so the ticket is dialable.
+    // Wait for a relay URL to be established so the ticket works across networks.
+    let relay = endpoint.home_relay().initialized().await;
+    info!(%relay, "relay established");
+
+    // Now grab the full NodeAddr (includes the relay URL + direct addrs).
     let addr = endpoint.node_addr().initialized().await;
 
     let ticket = Ticket::new(addr);
