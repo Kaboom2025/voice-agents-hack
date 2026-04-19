@@ -47,6 +47,8 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "cactus")]
 use crate::cactus::CactusModel;
+use crate::query::GeminiQueryClient;
+use crate::store::{EmbeddingStore, QueryFilter};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -85,6 +87,14 @@ struct Args {
         default_value = "/Users/danielargento/cactus/weights/gemma-4-e2b-it"
     )]
     model_path: PathBuf,
+
+    /// Gemini API key for RAG query parsing and answer synthesis.
+    #[arg(long, env = "GEMINI_API_KEY")]
+    gemini_api_key: Option<String>,
+
+    /// Max embedding chunks to retain in memory (older chunks evicted first).
+    #[arg(long, env = "STORE_MAX_SIZE", default_value_t = 10_000)]
+    store_max_size: usize,
 }
 
 #[tokio::main]
@@ -132,6 +142,15 @@ async fn main() -> Result<()> {
     println!("  2. From another computer (Remote):");
     println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
 
+    let store = Arc::new(EmbeddingStore::new(args.store_max_size));
+    let query_client = args.gemini_api_key.as_ref().map(|key| {
+        info!("gemini query client ready");
+        Arc::new(GeminiQueryClient::new(key.clone()))
+    });
+    if query_client.is_none() {
+        warn!("GEMINI_API_KEY not set — /api/query will return stub answers");
+    }
+
     // Load Gemma up front. If it fails, log and keep serving — the rest
     // of the leader (camera registry, live snapshots) still works.
     #[cfg(feature = "cactus")]
@@ -160,6 +179,8 @@ async fn main() -> Result<()> {
         next_req_id: Arc::new(AtomicU64::new(1)),
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
+        store,
+        query_client,
         #[cfg(feature = "cactus")]
         llm,
     };
@@ -284,6 +305,8 @@ struct AppState {
     next_req_id: Arc<AtomicU64>,
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
+    store: Arc<EmbeddingStore>,
+    query_client: Option<Arc<GeminiQueryClient>>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
 }
@@ -426,6 +449,7 @@ async fn serve_stream(
                             e.chunks_total.fetch_add(1, Ordering::Relaxed);
                             e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
                         }
+                        state.store.push(chunk.clone());
                         info!(
                             total = n,
                             camera = %chunk.camera_id,
@@ -615,10 +639,8 @@ async fn live_jpg(
 struct QueryReq {
     query: String,
     #[serde(default)]
-    #[allow(dead_code)]
     cameras: Option<Vec<String>>,
     #[serde(default)]
-    #[allow(dead_code)]
     top_k: Option<u32>,
 }
 
@@ -694,16 +716,110 @@ async fn query(
 
 #[cfg(not(feature = "cactus"))]
 async fn query(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<QueryReq>,
 ) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+
+    let Some(ref client) = state.query_client else {
+        return Json(QueryResp {
+            answer: format!(
+                "(GEMINI_API_KEY not configured — echoing) {}",
+                req.query
+            ),
+            citations: Vec::new(),
+            hits: Vec::new(),
+        })
+        .into_response();
+    };
+
+    let now = now_ms();
+    let available_cameras: Vec<String> = state
+        .registry
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+
+    let parsed = match client
+        .parse_nl_query(&req.query, now, &available_cameras)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            error!(%e, "parse_nl_query failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("parse error: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let filter = QueryFilter {
+        time_start_ms: parsed.time_start_ms,
+        time_end_ms: parsed.time_end_ms.or(Some(now)),
+        camera_ids: req.cameras.clone().or(parsed.camera_ids),
+        top_k: req.top_k.map(|k| k as usize).unwrap_or(parsed.top_k),
+    };
+    let chunks = state.store.query(&filter);
+    let n_chunks = chunks.len();
+
+    let answer = match client.synthesize_answer(&req.query, &chunks).await {
+        Ok(a) => a,
+        Err(e) => {
+            error!(%e, "synthesize_answer failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("synthesis error: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    info!(n_chunks, "query answered");
     Json(QueryResp {
-        answer: format!(
-            "(cactus feature disabled — echoing) {}",
-            req.query
-        ),
+        answer,
         citations: Vec::new(),
         hits: Vec::new(),
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::{EmbeddingStore, QueryFilter};
+    use common::EmbeddingChunk;
+    use std::sync::Arc;
+
+    fn make_chunk(camera_id: &str, ts_ms: u64) -> EmbeddingChunk {
+        EmbeddingChunk {
+            chunk_id: format!("{camera_id}-{ts_ms}"),
+            camera_id: camera_id.into(),
+            start_ts_ms: ts_ms,
+            end_ts_ms: ts_ms + 5000,
+            embedding: vec![0.1, 0.2],
+            video_dim: 0,
+            audio_dim: 0,
+            caption: None,
+            representative_jpeg: None,
+        }
+    }
+
+    #[test]
+    fn store_accessible_and_chunks_persist() {
+        let store = Arc::new(EmbeddingStore::new(1000));
+        store.push(make_chunk("cam-0", 1000));
+        store.push(make_chunk("cam-0", 6000));
+        let results = store.query(&QueryFilter {
+            time_start_ms: None,
+            time_end_ms: None,
+            camera_ids: None,
+            top_k: 10,
+        });
+        assert_eq!(results.len(), 2);
+    }
 }
