@@ -112,7 +112,8 @@ async fn main() -> Result<()> {
 
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
-        .discovery_n0().alpns(vec![INGEST_ALPN.to_vec()])
+        .discovery_n0()
+        .alpns(vec![INGEST_ALPN.to_vec()])
         .bind()
         .await?;
 
@@ -508,7 +509,10 @@ async fn serve_stream(
     if let Some(cid) = &camera_id {
         let mut reg = state.registry.write().expect("registry poisoned");
         if let Some(existing) = reg.get(cid) {
-            if Arc::ptr_eq(&existing.last_seen_ms, &entry.as_ref().unwrap().last_seen_ms) {
+            if Arc::ptr_eq(
+                &existing.last_seen_ms,
+                &entry.as_ref().unwrap().last_seen_ms,
+            ) {
                 reg.remove(cid);
                 info!(camera = %cid, "deregistered");
             }
@@ -583,16 +587,16 @@ async fn list_cameras(State(state): State<AppState>) -> Json<Vec<CameraJson>> {
     Json(out)
 }
 
-async fn live_jpg(
-    State(state): State<AppState>,
-    AxPath(camera_id): AxPath<String>,
-) -> Response {
+async fn live_jpg(State(state): State<AppState>, AxPath(camera_id): AxPath<String>) -> Response {
     let req_tx = {
         let reg = state.registry.read().expect("registry poisoned");
         match reg.get(&camera_id) {
             Some(e) => e.request_tx.clone(),
             None => {
-                return (StatusCode::NOT_FOUND, format!("camera '{camera_id}' not online"))
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("camera '{camera_id}' not online"),
+                )
                     .into_response();
             }
         }
@@ -601,7 +605,10 @@ async fn live_jpg(
     let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
     let (otx, orx) = oneshot::channel();
     if req_tx
-        .send(FrameReq { req_id, response_tx: otx })
+        .send(FrameReq {
+            req_id,
+            response_tx: otx,
+        })
         .await
         .is_err()
     {
@@ -621,9 +628,7 @@ async fn live_jpg(
             snap.jpeg,
         )
             .into_response(),
-        Ok(Ok(FrameOutcome::Err(msg))) => {
-            (StatusCode::BAD_GATEWAY, msg).into_response()
-        }
+        Ok(Ok(FrameOutcome::Err(msg))) => (StatusCode::BAD_GATEWAY, msg).into_response(),
         Ok(Err(_recv_err)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "follower closed before frame arrived",
@@ -652,10 +657,7 @@ struct QueryResp {
 }
 
 #[cfg(feature = "cactus")]
-async fn query(
-    State(state): State<AppState>,
-    Json(req): Json<QueryReq>,
-) -> Response {
+async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
     let Some(model) = state.llm.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -677,22 +679,21 @@ async fn query(
     info!(messages = %messages, "sending to gemma");
     let options = r#"{"max_tokens":2048}"#.to_string();
 
-    let out = tokio::task::spawn_blocking(move || {
-        model.complete(&messages, Some(&options))
-    })
-    .await;
+    let out = tokio::task::spawn_blocking(move || model.complete(&messages, Some(&options))).await;
 
     let raw = match out {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             error!(%e, "cactus_complete failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("gemma error: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("gemma error: {e}"),
+            )
                 .into_response();
         }
         Err(e) => {
             error!(%e, "cactus task panicked");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "gemma task panicked")
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "gemma task panicked").into_response();
         }
     };
 
@@ -703,7 +704,11 @@ async fn query(
     // if parsing fails.
     let answer = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
-        .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("response")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        })
         .unwrap_or(raw);
 
     Json(QueryResp {
@@ -715,20 +720,14 @@ async fn query(
 }
 
 #[cfg(not(feature = "cactus"))]
-async fn query(
-    State(state): State<AppState>,
-    Json(req): Json<QueryReq>,
-) -> Response {
+async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
 
     let Some(ref client) = state.query_client else {
         return Json(QueryResp {
-            answer: format!(
-                "(GEMINI_API_KEY not configured — echoing) {}",
-                req.query
-            ),
+            answer: format!("(GEMINI_API_KEY not configured — echoing) {}", req.query),
             citations: Vec::new(),
             hits: Vec::new(),
         })

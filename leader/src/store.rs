@@ -1,5 +1,5 @@
-use std::sync::RwLock;
 use common::EmbeddingChunk;
+use std::sync::RwLock;
 
 #[derive(Clone)]
 pub struct StoredChunk {
@@ -63,6 +63,7 @@ impl EmbeddingStore {
         matched
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.chunks.read().unwrap_or_else(|e| e.into_inner()).len()
     }

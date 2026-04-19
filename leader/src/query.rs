@@ -17,8 +17,7 @@ pub struct GeminiQueryClient {
     http: reqwest::Client,
 }
 
-const GEMINI_BASE: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
 impl GeminiQueryClient {
     pub fn new(api_key: impl Into<String>) -> Self {
@@ -76,18 +75,16 @@ impl GeminiQueryClient {
         Ok(ParsedQuery {
             time_start_ms: parsed["time_start_ms"].as_u64(),
             time_end_ms: parsed["time_end_ms"].as_u64(),
-            camera_ids: parsed["camera_ids"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()),
+            camera_ids: parsed["camera_ids"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            }),
             top_k: parsed["top_k"].as_u64().unwrap_or(20) as usize,
         })
     }
 
-    pub async fn synthesize_answer(
-        &self,
-        query: &str,
-        chunks: &[StoredChunk],
-    ) -> Result<String> {
+    pub async fn synthesize_answer(&self, query: &str, chunks: &[StoredChunk]) -> Result<String> {
         if chunks.is_empty() {
             return Ok("No camera footage found matching your query.".into());
         }
@@ -96,9 +93,11 @@ impl GeminiQueryClient {
             "text": "You are a security monitoring AI. Review the camera footage frames below and answer the security question."
         })];
 
-        for (sc, jpeg) in chunks.iter().filter_map(|sc| {
-            sc.chunk.representative_jpeg.as_ref().map(|jpeg| (sc, jpeg))
-        }).take(10) {
+        for (sc, jpeg) in chunks
+            .iter()
+            .filter_map(|sc| sc.chunk.representative_jpeg.as_ref().map(|jpeg| (sc, jpeg)))
+            .take(10)
+        {
             parts.push(json!({
                 "inline_data": {
                     "mime_type": "image/jpeg",
@@ -190,6 +189,7 @@ mod tests {
     use super::*;
     use common::EmbeddingChunk;
 
+    #[allow(dead_code)]
     fn stub_chunk(camera_id: &str, ts_ms: u64, jpeg: Option<Vec<u8>>) -> StoredChunk {
         StoredChunk {
             chunk: EmbeddingChunk {
