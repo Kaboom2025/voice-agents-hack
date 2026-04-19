@@ -6,11 +6,13 @@
 //! - `GET /api/live/:camera_id` — JPEG snapshot fetched on-demand from the
 //!   follower over the existing iroh connection.
 //!
-//! Gemma-4 captioning (formerly behind `--model-path`) is temporarily
-//! disabled — see `leader/src/cactus_llm.rs`. Re-add `cactus-sys` to the
-//! workspace + this binary to bring it back.
+//! When built with `--features cactus`, the leader also loads a Gemma
+//! instance at startup (see `src/cactus/`) and exposes `POST /api/query`
+//! that runs chat completion against it. Without the feature, that
+//! endpoint returns an echo response so the UI still works.
 
-// mod cactus_llm; // disabled: cactus-sys workspace dep is unavailable
+#[cfg(feature = "cactus")]
+mod cactus;
 
 use std::{
     collections::HashMap,
@@ -28,7 +30,7 @@ use axum::{
     extract::{Path as AxPath, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
@@ -38,8 +40,11 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router as IrohRouter},
     Endpoint, SecretKey, Watcher,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(feature = "cactus")]
+use crate::cactus::CactusModel;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -68,6 +73,16 @@ struct Args {
     /// How long to wait for a follower's frame response before giving up.
     #[arg(long, default_value_t = 2000)]
     frame_timeout_ms: u64,
+
+    /// Path to the Cactus-converted Gemma weights directory. When the
+    /// `cactus` feature is on, this model is loaded at startup and used
+    /// to answer `POST /api/query`. Ignored without the feature.
+    #[arg(
+        long,
+        env = "GEMMA_MODEL_PATH",
+        default_value = "/Users/danielargento/cactus/weights/gemma-4-e2b-it"
+    )]
+    model_path: PathBuf,
 }
 
 #[tokio::main]
@@ -110,12 +125,36 @@ async fn main() -> Result<()> {
     println!("  http on:     http://{}", args.http_addr);
     println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
 
+    // Load Gemma up front. If it fails, log and keep serving — the rest
+    // of the leader (camera registry, live snapshots) still works.
+    #[cfg(feature = "cactus")]
+    let llm = {
+        let path = args.model_path.clone();
+        info!(path = %path.display(), "loading gemma-4 via cactus");
+        match tokio::task::spawn_blocking(move || CactusModel::load(&path)).await {
+            Ok(Ok(m)) => {
+                info!("gemma-4 loaded");
+                Some(Arc::new(m))
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "cactus load failed; /api/query will return an error");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "cactus load task panicked");
+                None
+            }
+        }
+    };
+
     // Shared state used by both the iroh ingest handler and the HTTP server.
     let app_state = AppState {
         registry: Arc::new(RwLock::new(HashMap::new())),
         next_req_id: Arc::new(AtomicU64::new(1)),
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
+        #[cfg(feature = "cactus")]
+        llm,
     };
 
     let handler = IngestHandler {
@@ -238,6 +277,8 @@ struct AppState {
     next_req_id: Arc<AtomicU64>,
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
+    #[cfg(feature = "cactus")]
+    llm: Option<Arc<CactusModel>>,
 }
 
 fn now_ms() -> u64 {
@@ -428,6 +469,7 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
     let app = Router::new()
         .route("/api/cameras", get(list_cameras))
         .route("/api/live/:camera_id", get(live_jpg))
+        .route("/api/query", post(query))
         .layer(cors)
         .with_state(state);
 
@@ -527,4 +569,103 @@ async fn live_jpg(
             .into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "frame request timed out").into_response(),
     }
+}
+
+// ──────────────────────────── query (LLM) ────────────────────────────
+
+#[derive(Deserialize)]
+struct QueryReq {
+    query: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cameras: Option<Vec<String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    top_k: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct QueryResp {
+    answer: String,
+    citations: Vec<serde_json::Value>,
+    hits: Vec<serde_json::Value>,
+}
+
+#[cfg(feature = "cactus")]
+async fn query(
+    State(state): State<AppState>,
+    Json(req): Json<QueryReq>,
+) -> Response {
+    let Some(model) = state.llm.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gemma model not loaded on this leader",
+        )
+            .into_response();
+    };
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+
+    // Build messages identically to `examples/chat.rs` (which is known to
+    // work). Gemma-it chat templates don't accept a `system` role — if you
+    // include one the model ignores the user turn and replies "please
+    // provide a question".
+    let escaped = req.query.replace('\\', "\\\\").replace('"', "\\\"");
+    let messages = format!(r#"[{{"role":"user","content":"{}"}}]"#, escaped);
+    eprintln!(">>> gemma messages: {messages}");
+    info!(messages = %messages, "sending to gemma");
+    let options = r#"{"max_tokens":2048}"#.to_string();
+
+    let out = tokio::task::spawn_blocking(move || {
+        model.complete(&messages, Some(&options))
+    })
+    .await;
+
+    let raw = match out {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            error!(%e, "cactus_complete failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("gemma error: {e}"))
+                .into_response();
+        }
+        Err(e) => {
+            error!(%e, "cactus task panicked");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "gemma task panicked")
+                .into_response();
+        }
+    };
+
+    eprintln!("<<< gemma raw: {raw}");
+    info!(raw = %raw, "gemma raw response");
+    // Cactus returns a JSON blob with a `response` field plus timing
+    // stats. Extract just the answer text; fall back to the raw blob
+    // if parsing fails.
+    let answer = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(|s| s.to_string()))
+        .unwrap_or(raw);
+
+    Json(QueryResp {
+        answer,
+        citations: Vec::new(),
+        hits: Vec::new(),
+    })
+    .into_response()
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn query(
+    State(_state): State<AppState>,
+    Json(req): Json<QueryReq>,
+) -> Response {
+    Json(QueryResp {
+        answer: format!(
+            "(cactus feature disabled — echoing) {}",
+            req.query
+        ),
+        citations: Vec::new(),
+        hits: Vec::new(),
+    })
+    .into_response()
 }

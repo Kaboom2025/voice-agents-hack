@@ -163,7 +163,15 @@ export const httpClient: ApiClient = {
     return (await res.json()) as Camera[];
   },
 
-  query: mockClient.query,
+  async query(req) {
+    const res = await fetch("/api/query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`query: ${res.status} ${await res.text()}`);
+    return (await res.json()) as QueryResponse;
+  },
   rpcStream: mockClient.rpcStream,
 
   // The real live transport is browser-driven `<img>` polling against

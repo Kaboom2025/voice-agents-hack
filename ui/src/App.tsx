@@ -1,5 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import remarkBreaks from "remark-breaks";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
 import { api, type QueryResponse } from "./api";
 import { CameraScope, scopeToIds, type Scope } from "./components/CameraScope";
 import { LiveGrid } from "./components/LiveGrid";
@@ -59,8 +65,13 @@ export default function App() {
                 <div className="text-[11px] uppercase tracking-wider text-mute font-mono">
                   {last.question}
                 </div>
-                <div className="text-base leading-relaxed text-ink">
-                  {last.answer.answer}
+                <div className="markdown-body">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+                    rehypePlugins={[rehypeKatex]}
+                  >
+                    {last.answer.answer}
+                  </ReactMarkdown>
                 </div>
                 {last.answer.citations.length > 0 && (
                   <div className="flex flex-wrap gap-1.5 pt-3 border-t border-edge/60">

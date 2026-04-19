@@ -3,10 +3,15 @@ name = "leader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "leader"
 path = "src/main.rs"
+
+[features]
+default = []
+cactus = []
 
 [dependencies]
 anyhow.workspace = true
