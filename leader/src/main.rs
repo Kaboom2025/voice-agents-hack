@@ -13,6 +13,7 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+mod store;
 
 use std::{
     collections::HashMap,
