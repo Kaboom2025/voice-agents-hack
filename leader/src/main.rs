@@ -227,6 +227,7 @@ async fn main() -> Result<()> {
         gemini_embed,
         #[cfg(feature = "cactus")]
         llm,
+        embed_cache: Arc::new(RwLock::new(EmbedCache::default())),
     };
 
     let handler = IngestHandler {
@@ -355,6 +356,36 @@ struct AppState {
     gemini_embed: Option<Arc<GeminiEmbedClient>>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
+    /// Small LRU-ish cache for query-text → embedding. The embed step
+    /// (local Cactus or Gemini API) is the slowest part of search after
+    /// LLM synthesis is skipped, so caching repeat queries helps a lot
+    /// when iterating on the Image Search debug page.
+    embed_cache: Arc<RwLock<EmbedCache>>,
+}
+
+#[derive(Default)]
+struct EmbedCache {
+    entries: HashMap<String, Arc<Vec<f32>>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl EmbedCache {
+    const MAX: usize = 128;
+    fn get(&self, key: &str) -> Option<Arc<Vec<f32>>> {
+        self.entries.get(key).cloned()
+    }
+    fn put(&mut self, key: String, val: Arc<Vec<f32>>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.order.len() >= Self::MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, val);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -583,6 +614,7 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
         .route("/api/live/:camera_id", get(live_jpg))
         .route("/api/thumbnail/:chunk_id", get(thumbnail))
         .route("/api/query", post(query))
+        .route("/api/search", post(search))
         .layer(cors)
         .with_state(state);
 
@@ -794,9 +826,16 @@ async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredC
 }
 
 /// Embed query text for vector search. Uses local Cactus model when
-/// available (no network round-trip), Gemini API as fallback.
+/// available (no network round-trip), Gemini API as fallback. Results are
+/// cached in `state.embed_cache` keyed by the raw query string.
 #[cfg(feature = "cactus")]
 async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
+    // 0) Fast path: cached embedding for this exact query.
+    if let Some(cached) = state.embed_cache.read().ok().and_then(|c| c.get(query)) {
+        info!(dim = cached.len(), "query embedding served from cache");
+        return Ok((*cached).clone());
+    }
+
     // 1) Try local Cactus/Gemma text embedding (fast, no API key needed).
     if let Some(ref model) = state.llm {
         let model = Arc::clone(model);
@@ -804,6 +843,9 @@ async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
         match tokio::task::spawn_blocking(move || model.embed_text(&text, true)).await {
             Ok(Ok(vec)) => {
                 info!(dim = vec.len(), "query embedded via local cactus/gemma");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
                 return Ok(vec);
             }
             Ok(Err(e)) => {
@@ -820,6 +862,9 @@ async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
         match client.embed_text(query).await {
             Ok(vec) => {
                 info!(dim = vec.len(), "query embedded via gemini API");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
                 return Ok(vec);
             }
             Err(e) => {
@@ -835,10 +880,17 @@ async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
 
 #[cfg(not(feature = "cactus"))]
 async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
+    if let Some(cached) = state.embed_cache.read().ok().and_then(|c| c.get(query)) {
+        info!(dim = cached.len(), "query embedding served from cache");
+        return Ok((*cached).clone());
+    }
     if let Some(ref client) = state.gemini_embed {
         match client.embed_text(query).await {
             Ok(vec) => {
                 info!(dim = vec.len(), "query embedded via gemini API");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
                 return Ok(vec);
             }
             Err(e) => {
@@ -952,6 +1004,35 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
     );
 
     Json(QueryResp { answer, citations, hits }).into_response()
+}
+
+/// Retrieval-only endpoint: embeds the query and runs vector search, but
+/// skips LLM synthesis. Used by the Image Search debug UI and any caller
+/// that just wants hits (no generated answer). This is dramatically faster
+/// than `/api/query` because it avoids the Gemma generation step.
+#[derive(Serialize)]
+struct SearchResp {
+    hits: Vec<HitJson>,
+    took_ms: u64,
+}
+
+async fn search(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(%e, "search retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
+                .into_response();
+        }
+    };
+    let (hits, _citations) = scored_to_hits(&scored);
+    let took_ms = t0.elapsed().as_millis() as u64;
+    info!(n_hits = hits.len(), took_ms, query = %req.query, "search complete");
+    Json(SearchResp { hits, took_ms }).into_response()
 }
 
 #[cfg(test)]

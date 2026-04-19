@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api, type ClipHit, type QueryResponse } from "../api";
+import { api, type ClipHit, type SearchResponse } from "../api";
 import { CameraScope, scopeToIds, type Scope } from "../components/CameraScope";
 
 /**
@@ -8,19 +8,22 @@ import { CameraScope, scopeToIds, type Scope } from "../components/CameraScope";
  * the leader's embedding pipeline and displays the raw video-modality hits
  * (thumbnails + cosine scores) with no LLM synthesis. Useful for eyeballing
  * how well the image embeddings align with specific text queries.
+ *
+ * Uses `/api/search` (retrieval-only), which skips the Gemma generation
+ * step — this is typically 5-20x faster than `/api/query`.
  */
 export function ImageSearch() {
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(24);
-  const [last, setLast] = useState<{ question: string; answer: QueryResponse } | null>(null);
+  const [last, setLast] = useState<{ question: string; answer: SearchResponse } | null>(null);
 
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const ids = scopeToIds(scope, cameras);
 
   const search = useMutation({
     mutationFn: async (question: string) => {
-      const res = await api.query({
+      const res = await api.search({
         query: question,
         cameras: scope.kind === "all" ? undefined : ids,
         top_k: topK,
@@ -98,6 +101,9 @@ export function ImageSearch() {
             </div>
             <div className="text-[11px] font-mono text-mute">
               — {sorted.length} result{sorted.length !== 1 ? "s" : ""}
+            </div>
+            <div className="text-[11px] font-mono text-mute">
+              · {last.answer.took_ms} ms
             </div>
           </div>
 

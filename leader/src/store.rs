@@ -291,30 +291,29 @@ impl EmbeddingStore {
     ) -> Result<Vec<ScoredChunk>> {
         let where_filter = build_chroma_filter(filter);
 
-        // 1) Search video collection — query dim should match video dim.
-        let video_result = collections
+        // 1+2) Query video (and audio when applicable) in parallel.
+        let want_audio = matches!(filter.modality, SearchModality::All | SearchModality::Audio);
+        let video_fut = collections
             .video
-            .query(query_vec, filter.top_k * 2, where_filter.clone())
-            .await?;
+            .query(query_vec, filter.top_k * 2, where_filter.clone());
 
-        // 2) Search audio collection (if present and requested).
-        let audio_result = if matches!(filter.modality, SearchModality::All | SearchModality::Audio) {
+        let (video_result, audio_result) = if want_audio {
             if let Some(ref audio_client) = collections.audio {
-                // Audio query only works if query dim matches audio dim.
-                // For text queries this often won't match; we surface that
-                // loudly so the UI can tell the user audio is unavailable.
-                match audio_client.query(query_vec, filter.top_k * 2, where_filter).await {
+                let audio_fut = audio_client.query(query_vec, filter.top_k * 2, where_filter);
+                let (v, a) = tokio::join!(video_fut, audio_fut);
+                let audio = match a {
                     Ok(r) => Some(r),
                     Err(e) => {
                         warn_audio_query_failed_once(query_vec.len(), &e);
                         None
                     }
-                }
+                };
+                (v?, audio)
             } else {
-                None
+                (video_fut.await?, None)
             }
         } else {
-            None
+            (video_fut.await?, None)
         };
 
         // 3) Reciprocal Rank Fusion (PRD §5.4 step 3).
