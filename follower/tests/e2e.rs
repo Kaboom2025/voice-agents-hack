@@ -44,6 +44,8 @@ impl ProtocolHandler for TapHandler {
                                     write_frame(&mut send, &LeaderMsg::Ack { chunk_id: id }).await;
                             }
                             FollowerMsg::Bye => return,
+                            FollowerMsg::FrameResponse { .. } => {}
+                            FollowerMsg::FrameError { .. } => {}
                         }
                     }
                 });
