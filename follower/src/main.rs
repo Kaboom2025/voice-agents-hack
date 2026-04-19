@@ -365,19 +365,25 @@ async fn run_session(
         // Embed on a blocking thread — Cactus on CPU is slow.
         let seq = *total_sent;
         let emb = embedder.clone();
-        let out = match tokio::task::spawn_blocking(move || {
+        
+        let embed_handle = tokio::task::spawn_blocking(move || {
             emb.embed_chunk(&input, seq)
-        })
-        .await
-        {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => {
-                warn!(error = %e, "embed failed, skipping chunk");
-                continue;
-            }
-            Err(e) => {
-                warn!(error = %e, "embed task panicked");
-                continue;
+        });
+
+        let out = tokio::select! {
+            res = embed_handle => match res {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
+                    warn!(error = %e, "embed failed, skipping chunk");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, "embed task panicked");
+                    continue;
+                }
+            },
+            _ = &mut stop => {
+                break SessionEnd::CtrlC;
             }
         };
 
