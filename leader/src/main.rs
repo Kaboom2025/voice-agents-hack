@@ -9,18 +9,18 @@ mod cactus_llm;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use common::{FollowerMsg, INGEST_ALPN, LeaderMsg, Ticket, read_frame, write_frame};
+use common::{read_frame, write_frame, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN};
 use iroh::{
-    Endpoint, SecretKey, Watcher,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
+    Endpoint, SecretKey, Watcher,
 };
 use tracing::{error, info, warn};
 

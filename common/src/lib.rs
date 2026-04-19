@@ -6,7 +6,7 @@
 
 use std::{fmt, str::FromStr};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use iroh::NodeAddr;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,7 +40,9 @@ pub struct EmbeddingChunk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FollowerMsg {
     /// Sent once at connection start so the leader can register the follower.
-    Hello { camera_id: String },
+    Hello {
+        camera_id: String,
+    },
     Chunk(EmbeddingChunk),
     /// Graceful shutdown signal.
     Bye,
