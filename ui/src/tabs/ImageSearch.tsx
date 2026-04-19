@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api, type ClipHit, type SearchResponse } from "../api";
-import { CameraScope, scopeToIds, type Scope } from "../components/CameraScope";
 
 /**
  * Image Vector Search — a debug/testing page that runs the text query through
@@ -13,23 +12,26 @@ import { CameraScope, scopeToIds, type Scope } from "../components/CameraScope";
  * step — this is typically 5-20x faster than `/api/query`.
  */
 export function ImageSearch() {
-  const [scope, setScope] = useState<Scope>({ kind: "all" });
+  const [cameraId, setCameraId] = useState<string>("__all__");
   const [query, setQuery] = useState("");
   const [topK, setTopK] = useState(24);
-  const [last, setLast] = useState<{ question: string; answer: SearchResponse } | null>(null);
+  const [last, setLast] = useState<{
+    question: string;
+    cameraId: string;
+    answer: SearchResponse;
+  } | null>(null);
 
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
-  const ids = scopeToIds(scope, cameras);
 
   const search = useMutation({
     mutationFn: async (question: string) => {
       const res = await api.search({
         query: question,
-        cameras: scope.kind === "all" ? undefined : ids,
+        cameras: cameraId === "__all__" ? undefined : [cameraId],
         top_k: topK,
         modalities: ["video"],
       });
-      setLast({ question, answer: res });
+      setLast({ question, cameraId, answer: res });
       return res;
     },
   });
@@ -49,12 +51,8 @@ export function ImageSearch() {
 
   return (
     <div className="space-y-6">
-      <section className="space-y-3">
-        <CameraScope value={scope} onChange={setScope} />
-      </section>
-
       <section className="space-y-4">
-        <form onSubmit={onSubmit} className="glass rounded-3xl p-4 flex items-center gap-3">
+        <form onSubmit={onSubmit} className="glass rounded-3xl p-4 flex items-center gap-3 flex-wrap">
           <span className="text-[11px] uppercase tracking-wider text-mute font-mono pl-2">
             image search
           </span>
@@ -63,9 +61,24 @@ export function ImageSearch() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="e.g. a person wearing a red shirt"
-            className="flex-1 bg-transparent outline-none text-ink placeholder:text-mute text-sm py-2"
+            className="flex-1 min-w-[240px] bg-transparent outline-none text-ink placeholder:text-mute text-sm py-2"
             autoFocus
           />
+          <label className="flex items-center gap-2 text-[11px] font-mono text-mute">
+            camera
+            <select
+              value={cameraId}
+              onChange={(e) => setCameraId(e.target.value)}
+              className="bg-slate-100 border border-slate-200 rounded-lg px-2 py-1 text-ink text-xs font-mono focus:outline-none max-w-[180px]"
+            >
+              <option value="__all__">all cameras</option>
+              {cameras.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.id}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="flex items-center gap-2 text-[11px] font-mono text-mute">
             top_k
             <input
@@ -95,9 +108,12 @@ export function ImageSearch() {
 
       {last && (
         <section className="space-y-4">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
             <div className="text-[11px] uppercase tracking-wider text-mute font-mono">
               Image hits for: "{last.question}"
+            </div>
+            <div className="text-[11px] font-mono text-mute">
+              · camera: {last.cameraId === "__all__" ? "all" : last.cameraId}
             </div>
             <div className="text-[11px] font-mono text-mute">
               — {sorted.length} result{sorted.length !== 1 ? "s" : ""}
