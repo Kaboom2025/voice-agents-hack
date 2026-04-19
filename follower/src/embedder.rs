@@ -7,9 +7,9 @@ use std::path::Path;
 #[cfg(any(feature = "cactus", test))]
 use std::sync::Arc;
 
-use anyhow::Result;
 #[cfg(feature = "cactus")]
 use anyhow::Context;
+use anyhow::Result;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 #[cfg(feature = "cactus")]
@@ -31,6 +31,9 @@ fn l2_normalize(v: &mut [f32]) {
 /// Gemma-4-E2B hidden dimension — target for mean-pooled image embeddings.
 /// Chosen so image vectors match text embed dim for hybrid retrieval.
 pub const GEMMA4_HIDDEN_DIM: usize = 1536;
+
+/// Gemini embedding dimension — output from models/gemini-embedding-exp-03-07.
+pub const GEMINI_EMBED_DIM: usize = 3072;
 
 /// Turns a captured frame into an embedding vector + an optional caption.
 pub trait Embedder: Send + Sync {
