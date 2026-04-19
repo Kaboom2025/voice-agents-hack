@@ -1,5 +1,10 @@
 //! Leader: accepts ingest connections from any number of followers, prints
 //! a ticket on startup, and logs every chunk it receives.
+//!
+//! When `--model-path` is set (or `CACTUS_MODEL_PATH` env var), the leader
+//! loads Gemma 4 via cactus-sys and can caption / summarise incoming chunks.
+
+mod cactus_llm;
 
 use std::{
     path::{Path, PathBuf},
@@ -36,6 +41,11 @@ struct Args {
     /// Filter logs (default `info`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
+
+    /// Path to the Cactus model weights directory (e.g. gemma-4-e2b-it).
+    /// When set, the leader loads Gemma 4 on startup and can caption chunks.
+    #[arg(long, env = "CACTUS_MODEL_PATH")]
+    model_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -77,7 +87,25 @@ async fn main() -> Result<()> {
     println!("  ticket file: {}", args.ticket_file.display());
     println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
 
-    let handler = IngestHandler::default();
+    // Optionally load Gemma 4 via cactus-sys.
+    let model = match &args.model_path {
+        Some(path) => {
+            info!(path = %path.display(), "loading Gemma 4 model via cactus …");
+            let m = cactus_llm::CactusModel::load(path, None)
+                .with_context(|| format!("failed to load model from {}", path.display()))?;
+            info!("Gemma 4 model loaded");
+            Some(Arc::new(m))
+        }
+        None => {
+            info!("no --model-path set, running without LLM");
+            None
+        }
+    };
+
+    let handler = IngestHandler {
+        chunks_total: Arc::new(AtomicU64::new(0)),
+        model: model.clone(),
+    };
     let router = Router::builder(endpoint)
         .accept(INGEST_ALPN, handler)
         .spawn();
@@ -145,9 +173,10 @@ fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct IngestHandler {
     chunks_total: Arc<AtomicU64>,
+    model: Option<Arc<cactus_llm::CactusModel>>,
 }
 
 impl ProtocolHandler for IngestHandler {
@@ -178,6 +207,7 @@ impl IngestHandler {
             };
 
             let counter = self.chunks_total.clone();
+            let model = self.model.clone();
             tokio::spawn(async move {
                 let mut camera = String::from("<unknown>");
                 loop {
@@ -204,6 +234,51 @@ impl IngestHandler {
                                 caption = chunk.caption.as_deref().unwrap_or(""),
                                 "recv chunk",
                             );
+
+                            // If we have a loaded Gemma 4 model, generate a
+                            // summary / caption for the incoming chunk.
+                            if let Some(ref m) = model {
+                                let prompt = format!(
+                                    "Camera {} sent a video chunk ({}–{} ms). \
+                                     The follower-side caption is: \"{}\". \
+                                     Provide a one-sentence summary.",
+                                    chunk.camera_id,
+                                    chunk.start_ts_ms,
+                                    chunk.end_ts_ms,
+                                    chunk.caption.as_deref().unwrap_or("(none)"),
+                                );
+                                let messages = serde_json::json!([
+                                    {"role": "user", "content": prompt}
+                                ]);
+                                let options = serde_json::json!({
+                                    "max_tokens": 128
+                                });
+                                let chunk_id = chunk.chunk_id.clone();
+                                let m = m.clone();
+                                let msgs_str = messages.to_string();
+                                let opts_str = options.to_string();
+                                // Run inference on a blocking thread so we
+                                // don't stall the tokio runtime.
+                                tokio::task::spawn_blocking(move || {
+                                    match m.complete(&msgs_str, Some(&opts_str)) {
+                                        Ok(resp) => {
+                                            info!(
+                                                chunk = %chunk_id,
+                                                gemma4_response = %resp,
+                                                "LLM caption",
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                chunk = %chunk_id,
+                                                %e,
+                                                "Gemma 4 completion failed",
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+
                             // TODO: persist to ChromaDB / SQLite.
                             let ack = LeaderMsg::Ack {
                                 chunk_id: chunk.chunk_id,

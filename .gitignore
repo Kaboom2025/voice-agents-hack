@@ -6,3 +6,5 @@ Cargo.lock.bak
 .leader.key
 .leader.ticket
 *.key
+/weights/
+.venv/
