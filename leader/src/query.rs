@@ -96,7 +96,7 @@ impl CactusQueryHandler {
         // contain the semantic signal; trust them.
         let observations: Vec<String> = chunks
             .iter()
-            .take(20)
+            .take(10)
             .enumerate()
             .map(|(i, sc)| {
                 format!(
@@ -139,7 +139,7 @@ impl CactusQueryHandler {
         info!(n_chunks = chunks.len(), "synthesize_answer: invoking gemma (captions-only)");
         let t0 = Instant::now();
         let raw = tokio::task::spawn_blocking(move || {
-            model.complete(&messages, Some(r#"{"max_tokens":512,"temperature":0.2}"#))
+            model.complete(&messages, Some(r#"{"max_tokens":256,"temperature":0.2}"#))
         })
         .await
         .context("synthesis task panicked")?

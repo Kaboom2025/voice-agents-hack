@@ -49,6 +49,17 @@ export type SearchResponse = {
   took_ms: number;
 };
 
+export type AnswerRequest = {
+  query: string;
+  chunk_ids: string[];
+};
+
+export type AnswerResponse = {
+  answer: string;
+  citations: Citation[];
+  took_ms: number;
+};
+
 export type RpcMethod = "GetConfig" | "SetConfig" | "Ping" | "RotateKeys";
 
 export type RpcRequest = {
@@ -75,6 +86,7 @@ export interface ApiClient {
   listCameras(): Promise<Camera[]>;
   query(req: QueryRequest): Promise<QueryResponse>;
   search(req: QueryRequest): Promise<SearchResponse>;
+  answer(req: AnswerRequest): Promise<AnswerResponse>;
   rpcStream(req: RpcRequest): AsyncIterable<RpcEvent>;
   liveStream(cameraIds: string[], signal: AbortSignal): AsyncIterable<LiveFrame>;
   clipUrl(chunkId: string): string;
@@ -115,6 +127,16 @@ export const httpClient: ApiClient = {
     });
     if (!res.ok) throw new Error(`search: ${res.status} ${await res.text()}`);
     return (await res.json()) as SearchResponse;
+  },
+
+  async answer(req) {
+    const res = await fetch("/api/answer", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`answer: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AnswerResponse;
   },
 
   async *rpcStream(req) {

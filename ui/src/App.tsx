@@ -6,7 +6,7 @@ import remarkMath from "remark-math";
 import remarkBreaks from "remark-breaks";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
-import { api, type QueryResponse } from "./api";
+import { api, type ClipHit, type Citation } from "./api";
 import { CameraScope, scopeToIds, type Scope } from "./components/CameraScope";
 import { LiveGrid } from "./components/LiveGrid";
 import { VoiceBar } from "./components/VoiceBar";
@@ -14,6 +14,14 @@ import { ResultCard } from "./components/ResultCard";
 import { ImageSearch } from "./tabs/ImageSearch";
 
 type View = "ask" | "image-search";
+
+type AskState = {
+  question: string;
+  hits: ClipHit[];
+  answer: string | null;       // null while LLM is still generating
+  citations: Citation[];
+  answerError: string | null;
+};
 
 function hitsGridCols(n: number): string {
   if (n <= 1) return "grid-cols-1";
@@ -24,25 +32,53 @@ function hitsGridCols(n: number): string {
 
 export default function App() {
   const [scope, setScope] = useState<Scope>({ kind: "all" });
-  const [last, setLast] = useState<{ question: string; answer: QueryResponse } | null>(null);
+  const [last, setLast] = useState<AskState | null>(null);
   const [view, setView] = useState<View>("ask");
 
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const ids = scopeToIds(scope, cameras);
 
+  // Two-phase Ask flow: retrieve clips fast, then fetch the LLM answer.
+  // The UI renders the hits the moment phase 1 returns, so the user
+  // doesn't wait on Gemma for visual feedback.
   const ask = useMutation({
     mutationFn: async (question: string) => {
-      const res = await api.query({
+      // Phase 1 — fast vector retrieval (no LLM).
+      const search = await api.search({
         query: question,
         cameras: scope.kind === "all" ? undefined : ids,
         top_k: 12,
       });
-      setLast({ question, answer: res });
-      return res;
+      setLast({
+        question,
+        hits: search.hits,
+        answer: null,
+        citations: [],
+        answerError: null,
+      });
+
+      // Phase 2 — LLM synthesis, fills in the AI Analysis card.
+      try {
+        const ans = await api.answer({
+          query: question,
+          chunk_ids: search.hits.map((h) => h.chunk_id),
+        });
+        setLast((prev) =>
+          prev && prev.question === question
+            ? { ...prev, answer: ans.answer, citations: ans.citations }
+            : prev,
+        );
+      } catch (err) {
+        setLast((prev) =>
+          prev && prev.question === question
+            ? { ...prev, answerError: (err as Error).message }
+            : prev,
+        );
+      }
     },
   });
 
-  const hits = last?.answer.hits ?? [];
+  const hits = last?.hits ?? [];
   const hasHits = hits.length > 0;
 
   return (
@@ -94,7 +130,7 @@ export default function App() {
             placeholder="Ask the cameras anything…"
           />
 
-          {ask.isPending && (
+          {ask.isPending && !last && (
             <div className="flex items-center gap-2 text-mute text-sm px-1">
               <span className="size-2 rounded-full bg-accent animate-pulse" />
               Searching across {ids.length} camera{ids.length !== 1 ? "s" : ""}…
@@ -137,24 +173,40 @@ export default function App() {
                   <circle cx="15" cy="14" r="1" fill="currentColor" />
                 </svg>
                 AI Analysis
+                {last.answer === null && !last.answerError && (
+                  <span className="flex items-center gap-1.5 text-mute normal-case tracking-normal">
+                    <span className="size-1.5 rounded-full bg-accent animate-pulse" />
+                    generating…
+                  </span>
+                )}
               </div>
-              <div className="markdown-body text-ink">
-                <ReactMarkdown
-                  remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-                  rehypePlugins={[rehypeKatex]}
-                >
-                  {last.answer.answer}
-                </ReactMarkdown>
-              </div>
+              {last.answer === null && !last.answerError ? (
+                <div className="space-y-2">
+                  <div className="h-3 w-3/4 rounded bg-slate-200 animate-pulse" />
+                  <div className="h-3 w-5/6 rounded bg-slate-200 animate-pulse" />
+                  <div className="h-3 w-2/3 rounded bg-slate-200 animate-pulse" />
+                </div>
+              ) : last.answerError ? (
+                <div className="text-sm text-red-600">{last.answerError}</div>
+              ) : (
+                <div className="markdown-body text-ink">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
+                    rehypePlugins={[rehypeKatex]}
+                  >
+                    {last.answer}
+                  </ReactMarkdown>
+                </div>
+              )}
 
               {/* Source citations */}
-              {last.answer.citations.length > 0 && (
+              {last.citations.length > 0 && (
                 <div className="space-y-2 pt-3 border-t border-edge/60">
                   <div className="text-[11px] uppercase tracking-wider text-mute font-mono">
                     Sources
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {last.answer.citations.map((c) => (
+                    {last.citations.map((c) => (
                       <span
                         key={c.chunk_id}
                         className="px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-[11px] font-mono text-mute"

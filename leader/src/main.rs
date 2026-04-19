@@ -615,6 +615,7 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
         .route("/api/thumbnail/:chunk_id", get(thumbnail))
         .route("/api/query", post(query))
         .route("/api/search", post(search))
+        .route("/api/answer", post(answer))
         .layer(cors)
         .with_state(state);
 
@@ -1033,6 +1034,93 @@ async fn search(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Res
     let took_ms = t0.elapsed().as_millis() as u64;
     info!(n_hits = hits.len(), took_ms, query = %req.query, "search complete");
     Json(SearchResp { hits, took_ms }).into_response()
+}
+
+/// LLM-synthesis-only endpoint. Takes a question plus a set of chunk IDs
+/// (typically returned by `/api/search`) and runs the Cactus/Gemma answer
+/// synthesis. Lets the UI split a "query" into a fast retrieval phase
+/// (shown immediately) and a slower synthesis phase (filled in when
+/// ready) for much better perceived latency.
+#[derive(Deserialize)]
+struct AnswerReq {
+    query: String,
+    #[serde(default)]
+    chunk_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AnswerResp {
+    answer: String,
+    citations: Vec<CitationJson>,
+    took_ms: u64,
+}
+
+#[cfg(feature = "cactus")]
+async fn answer(State(state): State<AppState>, Json(req): Json<AnswerReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+
+    // Rehydrate the StoredChunks for the supplied IDs, preserving order.
+    let chunks: Vec<store::StoredChunk> = req
+        .chunk_ids
+        .iter()
+        .filter_map(|id| state.store.get_by_id(id))
+        .collect();
+
+    let citations: Vec<CitationJson> = chunks
+        .iter()
+        .map(|sc| CitationJson {
+            camera_id: sc.chunk.camera_id.clone(),
+            chunk_id: sc.chunk.chunk_id.clone(),
+            start_ts_ms: sc.chunk.start_ts_ms,
+            end_ts_ms: sc.chunk.end_ts_ms,
+        })
+        .collect();
+
+    let answer_text = if let Some(model) = state.llm.clone() {
+        let handler = CactusQueryHandler::new(model);
+        match handler.synthesize_answer(&req.query, &chunks, &state.store).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%e, "LLM synthesis failed");
+                format!("LLM synthesis failed: {e}")
+            }
+        }
+    } else {
+        "LLM not loaded.".to_string()
+    };
+
+    let took_ms = t0.elapsed().as_millis() as u64;
+    info!(n_chunks = chunks.len(), took_ms, "answer complete");
+    Json(AnswerResp { answer: answer_text, citations, took_ms }).into_response()
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn answer(State(state): State<AppState>, Json(req): Json<AnswerReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+    let citations: Vec<CitationJson> = req
+        .chunk_ids
+        .iter()
+        .filter_map(|id| state.store.get_by_id(id))
+        .map(|sc| CitationJson {
+            camera_id: sc.chunk.camera_id.clone(),
+            chunk_id: sc.chunk.chunk_id.clone(),
+            start_ts_ms: sc.chunk.start_ts_ms,
+            end_ts_ms: sc.chunk.end_ts_ms,
+        })
+        .collect();
+    let took_ms = t0.elapsed().as_millis() as u64;
+    Json(AnswerResp {
+        answer: "Build with --features cactus for LLM-synthesized answers.".into(),
+        citations,
+        took_ms,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
