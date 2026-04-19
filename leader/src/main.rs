@@ -13,6 +13,7 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+#[cfg(feature = "cactus")]
 mod query;
 mod store;
 
@@ -47,7 +48,8 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "cactus")]
 use crate::cactus::CactusModel;
-use crate::query::GeminiQueryClient;
+#[cfg(feature = "cactus")]
+use crate::query::CactusQueryHandler;
 use crate::store::{EmbeddingStore, QueryFilter};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
@@ -87,10 +89,6 @@ struct Args {
         default_value = "/Users/danielargento/cactus/weights/gemma-4-e2b-it"
     )]
     model_path: PathBuf,
-
-    /// Gemini API key for RAG query parsing and answer synthesis.
-    #[arg(long, env = "GEMINI_API_KEY")]
-    gemini_api_key: Option<String>,
 
     /// Max embedding chunks to retain in memory (older chunks evicted first).
     #[arg(long, env = "STORE_MAX_SIZE", default_value_t = 10_000)]
@@ -144,13 +142,6 @@ async fn main() -> Result<()> {
     println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
 
     let store = Arc::new(EmbeddingStore::new(args.store_max_size));
-    let query_client = args.gemini_api_key.as_ref().map(|key| {
-        info!("gemini query client ready");
-        Arc::new(GeminiQueryClient::new(key.clone()))
-    });
-    if query_client.is_none() {
-        warn!("GEMINI_API_KEY not set — /api/query will return stub answers");
-    }
 
     // Load Gemma up front. If it fails, log and keep serving — the rest
     // of the leader (camera registry, live snapshots) still works.
@@ -181,7 +172,6 @@ async fn main() -> Result<()> {
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
         store,
-        query_client,
         #[cfg(feature = "cactus")]
         llm,
     };
@@ -307,7 +297,6 @@ struct AppState {
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
     store: Arc<EmbeddingStore>,
-    query_client: Option<Arc<GeminiQueryClient>>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
 }
@@ -659,81 +648,13 @@ struct QueryResp {
 #[cfg(feature = "cactus")]
 async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
     let Some(model) = state.llm.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gemma model not loaded on this leader",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, "gemma model not loaded").into_response();
     };
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
 
-    // Build messages identically to `examples/chat.rs` (which is known to
-    // work). Gemma-it chat templates don't accept a `system` role — if you
-    // include one the model ignores the user turn and replies "please
-    // provide a question".
-    let escaped = req.query.replace('\\', "\\\\").replace('"', "\\\"");
-    let messages = format!(r#"[{{"role":"user","content":"{}"}}]"#, escaped);
-    eprintln!(">>> gemma messages: {messages}");
-    info!(messages = %messages, "sending to gemma");
-    let options = r#"{"max_tokens":2048}"#.to_string();
-
-    let out = tokio::task::spawn_blocking(move || model.complete(&messages, Some(&options))).await;
-
-    let raw = match out {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            error!(%e, "cactus_complete failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("gemma error: {e}"),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            error!(%e, "cactus task panicked");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "gemma task panicked").into_response();
-        }
-    };
-
-    eprintln!("<<< gemma raw: {raw}");
-    info!(raw = %raw, "gemma raw response");
-    // Cactus returns a JSON blob with a `response` field plus timing
-    // stats. Extract just the answer text; fall back to the raw blob
-    // if parsing fails.
-    let answer = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| {
-            v.get("response")
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or(raw);
-
-    Json(QueryResp {
-        answer,
-        citations: Vec::new(),
-        hits: Vec::new(),
-    })
-    .into_response()
-}
-
-#[cfg(not(feature = "cactus"))]
-async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
-    if req.query.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty query").into_response();
-    }
-
-    let Some(ref client) = state.query_client else {
-        return Json(QueryResp {
-            answer: format!("(GEMINI_API_KEY not configured — echoing) {}", req.query),
-            citations: Vec::new(),
-            hits: Vec::new(),
-        })
-        .into_response();
-    };
-
+    let handler = CactusQueryHandler::new(model);
     let now = now_ms();
     let available_cameras: Vec<String> = state
         .registry
@@ -743,17 +664,11 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
         .cloned()
         .collect();
 
-    let parsed = match client
-        .parse_nl_query(&req.query, now, &available_cameras)
-        .await
-    {
+    let parsed = match handler.parse_nl_query(&req.query, now, &available_cameras).await {
         Ok(p) => p,
         Err(e) => {
             error!(%e, "parse_nl_query failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("parse error: {e}"),
-            )
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("parse error: {e}"))
                 .into_response();
         }
     };
@@ -767,21 +682,26 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
     let chunks = state.store.query(&filter);
     let n_chunks = chunks.len();
 
-    let answer = match client.synthesize_answer(&req.query, &chunks).await {
+    let answer = match handler.synthesize_answer(&req.query, &chunks).await {
         Ok(a) => a,
         Err(e) => {
             error!(%e, "synthesize_answer failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("synthesis error: {e}"),
-            )
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("synthesis error: {e}"))
                 .into_response();
         }
     };
 
     info!(n_chunks, "query answered");
+    Json(QueryResp { answer, citations: Vec::new(), hits: Vec::new() }).into_response()
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn query(_state: State<AppState>, Json(req): Json<QueryReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
     Json(QueryResp {
-        answer,
+        answer: "Build with --features cactus to enable RAG query support.".into(),
         citations: Vec::new(),
         hits: Vec::new(),
     })

@@ -1,8 +1,10 @@
+use std::io::Write;
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use serde::Deserialize;
 use serde_json::json;
 
+use crate::cactus::CactusModel;
 use crate::store::StoredChunk;
 
 pub struct ParsedQuery {
@@ -12,19 +14,13 @@ pub struct ParsedQuery {
     pub top_k: usize,
 }
 
-pub struct GeminiQueryClient {
-    api_key: String,
-    http: reqwest::Client,
+pub struct CactusQueryHandler {
+    model: Arc<CactusModel>,
 }
 
-const GEMINI_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
-
-impl GeminiQueryClient {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            api_key: api_key.into(),
-            http: reqwest::Client::new(),
-        }
+impl CactusQueryHandler {
+    pub fn new(model: Arc<CactusModel>) -> Self {
+        Self { model }
     }
 
     pub async fn parse_nl_query(
@@ -36,41 +32,32 @@ impl GeminiQueryClient {
         let camera_list = available_cameras.join(", ");
         let thirty_min_ago = now_ms.saturating_sub(30 * 60 * 1000);
         let prompt = format!(
-            "Parse this security monitoring query into a JSON object.\n\
+            "Parse this security monitoring query and return ONLY a JSON object, nothing else.\n\
             Current time: {now_ms} ms since epoch.\n\
             Available cameras: [{camera_list}].\n\n\
             Query: \"{query}\"\n\n\
             Return JSON with exactly these fields:\n\
-            - \"time_start_ms\": integer or null (null = no lower bound; \
-              'last 30 minutes' → {thirty_min_ago})\n\
+            - \"time_start_ms\": integer or null (null = no lower bound; 'last 30 minutes' → {thirty_min_ago})\n\
             - \"time_end_ms\": integer or null (null = use current time {now_ms})\n\
-            - \"camera_ids\": array of strings or null (null = all cameras; \
-              map location words to camera IDs from the available list)\n\
-            - \"top_k\": integer, default 20, max 50"
+            - \"camera_ids\": array of strings or null (null = all cameras)\n\
+            - \"top_k\": integer, default 20, max 50\n\n\
+            Example: {{\"time_start_ms\":{thirty_min_ago},\"time_end_ms\":null,\"camera_ids\":null,\"top_k\":20}}\n\
+            Output only the JSON object:"
         );
 
-        let body = json!({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
-        });
-        let url = format!("{GEMINI_BASE}/gemini-2.0-flash:generateContent");
-        let resp: GeminiResponse = self
-            .http
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("gemini parse request")?
-            .error_for_status()
-            .context("gemini parse status")?
-            .json()
-            .await
-            .context("gemini parse decode")?;
+        let messages = text_messages(&prompt);
+        let model = Arc::clone(&self.model);
+        let raw = tokio::task::spawn_blocking(move || {
+            model.complete(&messages, Some(r#"{"max_tokens":256}"#))
+        })
+        .await
+        .context("parse task panicked")?
+        .context("cactus parse failed")?;
 
-        let text = extract_text(&resp);
-        let parsed: serde_json::Value = serde_json::from_str(text)
-            .with_context(|| format!("gemini returned non-JSON for parse: {text}"))?;
+        let response = extract_response(&raw);
+        let json_str = find_json(&response).unwrap_or(&response);
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .with_context(|| format!("gemma returned non-JSON: {response}"))?;
 
         Ok(ParsedQuery {
             time_start_ms: parsed["time_start_ms"].as_u64(),
@@ -89,143 +76,116 @@ impl GeminiQueryClient {
             return Ok("No camera footage found matching your query.".into());
         }
 
-        let mut parts: Vec<serde_json::Value> = vec![json!({
-            "text": "You are a security monitoring AI. Review the camera footage frames below and answer the security question."
-        })];
-
-        for (sc, jpeg) in chunks
+        // Write representative JPEGs to temp files; Cactus reads them by path.
+        let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
+        let mut image_paths: Vec<String> = Vec::new();
+        for (_sc, jpeg) in chunks
             .iter()
-            .filter_map(|sc| sc.chunk.representative_jpeg.as_ref().map(|jpeg| (sc, jpeg)))
+            .filter_map(|sc| sc.chunk.representative_jpeg.as_ref().map(|j| (sc, j)))
             .take(10)
         {
-            parts.push(json!({
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": B64.encode(jpeg)
-                }
-            }));
-            parts.push(json!({
-                "text": format!(
-                    "[Camera: {} | {}ms – {}ms]",
-                    sc.chunk.camera_id, sc.chunk.start_ts_ms, sc.chunk.end_ts_ms
-                )
-            }));
+            let mut tmp = tempfile::Builder::new()
+                .suffix(".jpg")
+                .tempfile()
+                .context("create temp jpeg")?;
+            tmp.write_all(jpeg).context("write temp jpeg")?;
+            image_paths.push(tmp.path().to_string_lossy().into_owned());
+            temp_files.push(tmp);
         }
 
-        let text_context: Vec<String> = chunks
+        let observations: Vec<String> = chunks
             .iter()
-            .filter(|sc| sc.chunk.representative_jpeg.is_none())
             .map(|sc| {
                 format!(
-                    "[{} at {}ms] {}",
+                    "[{} {}ms–{}ms] {}",
                     sc.chunk.camera_id,
                     sc.chunk.start_ts_ms,
-                    sc.chunk.caption.as_deref().unwrap_or("no description")
+                    sc.chunk.end_ts_ms,
+                    sc.chunk.caption.as_deref().unwrap_or("no description"),
                 )
             })
             .collect();
-        if !text_context.is_empty() {
-            parts.push(json!({
-                "text": format!("Additional observations (no frame):\n{}", text_context.join("\n"))
-            }));
-        }
 
-        parts.push(json!({
-            "text": format!(
-                "Security question: {query}\n\nAnswer concisely based only on the footage above."
-            )
-        }));
+        let content = format!(
+            "You are a security monitoring AI. Review the footage and answer concisely.\n\n\
+            Observations:\n{}\n\n\
+            Question: {query}",
+            observations.join("\n")
+        );
 
-        let body = json!({ "contents": [{"parts": parts}] });
-        let url = format!("{GEMINI_BASE}/gemini-2.0-flash:generateContent");
-        let resp: GeminiResponse = self
-            .http
-            .post(&url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("gemini synthesis request")?
-            .error_for_status()
-            .context("gemini synthesis status")?
-            .json()
-            .await
-            .context("gemini synthesis decode")?;
+        let messages = if image_paths.is_empty() {
+            text_messages(&content)
+        } else {
+            vision_messages(&content, &image_paths)
+        };
 
-        Ok(extract_text(&resp).to_string())
+        let model = Arc::clone(&self.model);
+        let raw = tokio::task::spawn_blocking(move || {
+            // Keep temp files alive until Cactus finishes reading them.
+            let _keep = temp_files;
+            model.complete(&messages, Some(r#"{"max_tokens":1024}"#))
+        })
+        .await
+        .context("synthesis task panicked")?
+        .context("cactus synthesis failed")?;
+
+        Ok(extract_response(&raw).to_string())
     }
 }
 
-#[derive(Deserialize)]
-struct GeminiResponse {
-    candidates: Vec<Candidate>,
+fn text_messages(content: &str) -> String {
+    let escaped = content
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    format!(r#"[{{"role":"user","content":"{escaped}"}}]"#)
 }
 
-#[derive(Deserialize)]
-struct Candidate {
-    content: Content,
+fn vision_messages(content: &str, image_paths: &[String]) -> String {
+    json!([{
+        "role": "user",
+        "content": content,
+        "images": image_paths,
+    }])
+    .to_string()
 }
 
-#[derive(Deserialize)]
-struct Content {
-    parts: Vec<Part>,
+fn extract_response(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v["response"].as_str().map(String::from))
+        .unwrap_or_else(|| raw.to_string())
 }
 
-#[derive(Deserialize)]
-struct Part {
-    text: String,
-}
-
-fn extract_text(resp: &GeminiResponse) -> &str {
-    resp.candidates
-        .first()
-        .and_then(|c| c.content.parts.first())
-        .map(|p| p.text.as_str())
-        .unwrap_or("")
+fn find_json(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end > start).then(|| &text[start..=end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::EmbeddingChunk;
 
-    #[allow(dead_code)]
-    fn stub_chunk(camera_id: &str, ts_ms: u64, jpeg: Option<Vec<u8>>) -> StoredChunk {
-        StoredChunk {
-            chunk: EmbeddingChunk {
-                chunk_id: format!("{camera_id}-{ts_ms}"),
-                camera_id: camera_id.into(),
-                start_ts_ms: ts_ms,
-                end_ts_ms: ts_ms + 5000,
-                embedding: vec![],
-                video_dim: 0,
-                audio_dim: 0,
-                caption: Some(format!("scene at {ts_ms}")),
-                representative_jpeg: jpeg,
-            },
-        }
+    #[test]
+    fn find_json_extracts_embedded_object() {
+        let text = r#"Sure! Here is the JSON: {"top_k":20} done."#;
+        assert_eq!(find_json(text), Some(r#"{"top_k":20}"#));
     }
 
     #[test]
-    fn parse_gemini_response_extracts_text() {
-        let raw = r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
-        let resp: GeminiResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(extract_text(&resp), "hello");
+    fn find_json_returns_none_on_no_braces() {
+        assert_eq!(find_json("no json here"), None);
     }
 
     #[test]
-    fn parse_gemini_response_returns_empty_on_no_candidates() {
-        let raw = r#"{"candidates":[]}"#;
-        let resp: GeminiResponse = serde_json::from_str(raw).unwrap();
-        assert_eq!(extract_text(&resp), "");
+    fn extract_response_unwraps_cactus_json() {
+        let raw = r#"{"response":"hello world","timings":{}}"#;
+        assert_eq!(extract_response(raw), "hello world");
     }
 
     #[test]
-    fn empty_chunks_returns_no_footage_message() {
-        let client = GeminiQueryClient::new("dummy");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(client.synthesize_answer("anything?", &[]));
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("No camera footage"));
+    fn extract_response_falls_back_to_raw() {
+        assert_eq!(extract_response("plain text"), "plain text");
     }
 }
