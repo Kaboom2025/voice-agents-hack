@@ -1,6 +1,11 @@
 //! Embedding strategies. The `Embedder` trait hides whether we're
 //! calling real Cactus/Gemma or producing a deterministic synthetic
 //! vector — the transport layer doesn't know or care.
+//!
+//! PRD §5.1: each 5 s chunk samples K=4 evenly-spaced frames and the
+//! audio segment. PRD §5.2: the video embedding is mean-pooled across
+//! K frames, the audio embedding is produced separately, and the final
+//! vector is `[video_emb || audio_emb]`, L2-normalized.
 
 #[cfg(feature = "cactus")]
 use std::path::Path;
@@ -32,21 +37,34 @@ fn l2_normalize(v: &mut [f32]) {
 /// Chosen so image vectors match text embed dim for hybrid retrieval.
 pub const GEMMA4_HIDDEN_DIM: usize = 1536;
 
-/// Gemini embedding dimension — output from models/gemini-embedding-exp-03-07.
+/// Gemini embedding dimension — output from models/gemini-embedding-2-preview.
 pub const GEMINI_EMBED_DIM: usize = 3072;
 
-/// Turns a captured frame into an embedding vector + an optional caption.
+/// Input to the embedder: K frames from a 5 s window plus the audio
+/// segment captured during that window.
+pub struct ChunkInput {
+    /// K evenly-spaced frames sampled from the chunk window.
+    pub frames: Vec<CapturedFrame>,
+    /// 16 kHz mono f32 audio samples for the chunk window. Empty if no
+    /// microphone is available.
+    pub audio_samples: Vec<f32>,
+}
+
+/// Turns a chunk (multiple frames + audio) into an embedding vector +
+/// an optional caption.
 pub trait Embedder: Send + Sync {
-    /// Dimensionality this embedder produces. 0 means "variable" (Cactus
-    /// returns ~2048 for gemma-4-E2B images; callers should use
-    /// `.len()` on the actual output rather than relying on `dim`).
+    /// Dimensionality this embedder produces. 0 means "variable".
     fn dim(&self) -> usize;
 
-    fn embed_frame(&self, frame: &CapturedFrame, seq: u64) -> Result<EmbeddingOutput>;
+    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput>;
 }
 
 pub struct EmbeddingOutput {
     pub embedding: Vec<f32>,
+    /// Dimensionality of the video portion of the embedding.
+    pub video_dim: usize,
+    /// Dimensionality of the audio portion (0 when audio is unavailable).
+    pub audio_dim: usize,
     pub caption: Option<String>,
 }
 
@@ -62,8 +80,6 @@ pub struct CactusEmbedder {
 
 #[cfg(feature = "cactus")]
 impl CactusEmbedder {
-    /// Create with a loaded Cactus model. JPEG intermediates are written
-    /// to `std::env::temp_dir()` by default; override with [`with_tmp_dir`].
     pub fn new(model: Arc<CactusModel>) -> Self {
         Self {
             model,
@@ -78,17 +94,11 @@ impl CactusEmbedder {
         self
     }
 
-    /// Use `prefix` (e.g. the camera id) as the JPEG filename stem,
-    /// combined with the chunk sequence to produce unique per-frame
-    /// filenames. When set, every captured frame is persisted rather
-    /// than rotated.
     pub fn with_file_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.file_prefix = prefix.into();
         self
     }
 
-    /// Write an RGB frame as JPEG at `path`. JPEG (not PNG) to keep disk
-    /// I/O small on the hot path — Cactus decodes either fine.
     fn write_jpeg(&self, frame: &CapturedFrame, path: &Path) -> Result<()> {
         use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
         use std::fs::File;
@@ -105,6 +115,56 @@ impl CactusEmbedder {
             .with_context(|| format!("encode jpeg at {}", path.display()))?;
         Ok(())
     }
+
+    /// Embed K frames: embed each independently, then mean-pool across
+    /// all K per-frame embeddings to get a single video vector.
+    fn embed_frames(&self, frames: &[CapturedFrame], seq: u64) -> Result<Vec<f32>> {
+        let mut per_frame_pooled: Vec<Vec<f32>> = Vec::with_capacity(frames.len());
+        for (i, frame) in frames.iter().enumerate() {
+            let path = self
+                .tmp_dir
+                .join(format!("{}-{seq:06}-f{i}.jpg", self.file_prefix));
+            self.write_jpeg(frame, &path)?;
+            let raw = self
+                .model
+                .embed_image(&path)
+                .with_context(|| format!("cactus image embed frame {i}"))?;
+            let pooled = mean_pool(&raw, GEMMA4_HIDDEN_DIM)
+                .context("mean pool per-frame image embedding")?;
+            per_frame_pooled.push(pooled);
+        }
+        // Mean-pool across K frames → single [GEMMA4_HIDDEN_DIM] video vec.
+        let k = per_frame_pooled.len();
+        let mut video_emb = vec![0f32; GEMMA4_HIDDEN_DIM];
+        for p in &per_frame_pooled {
+            for (v, x) in video_emb.iter_mut().zip(p.iter()) {
+                *v += *x;
+            }
+        }
+        let inv = 1.0 / k as f32;
+        for v in &mut video_emb {
+            *v *= inv;
+        }
+        Ok(video_emb)
+    }
+
+    /// Embed the audio segment. Returns an empty vec if no audio.
+    fn embed_audio(&self, samples: &[f32], seq: u64) -> Result<Vec<f32>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wav_path = self
+            .tmp_dir
+            .join(format!("{}-{seq:06}.wav", self.file_prefix));
+        crate::audio::write_wav(&wav_path, samples)?;
+        let raw = self
+            .model
+            .embed_audio(&wav_path)
+            .context("cactus audio embed")?;
+        let pooled =
+            mean_pool(&raw, GEMMA4_HIDDEN_DIM).context("mean pool audio embedding")?;
+        Ok(pooled)
+    }
 }
 
 #[cfg(feature = "cactus")]
@@ -113,40 +173,43 @@ impl Embedder for CactusEmbedder {
         0
     }
 
-    fn embed_frame(&self, frame: &CapturedFrame, seq: u64) -> Result<EmbeddingOutput> {
-        // One file per chunk — callers that care about disk pressure can
-        // point `with_tmp_dir` at a scratch location and prune externally.
-        let path = self
-            .tmp_dir
-            .join(format!("{}-{seq:06}.jpg", self.file_prefix));
-        self.write_jpeg(frame, &path)?;
+    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
+        let mut video_emb = self.embed_frames(&input.frames, seq)?;
+        let video_dim = video_emb.len();
+        l2_normalize(&mut video_emb);
 
-        let raw = self
-            .model
-            .embed_image(&path)
-            .context("cactus image embed")?;
-        // Gemma-4 returns the pre-pooled vision tensor. Mean-pool over
-        // patches to get a fixed-size, shippable vector.
-        let mut pooled =
-            mean_pool(&raw, GEMMA4_HIDDEN_DIM).context("mean pool gemma-4 image embedding")?;
-        l2_normalize(&mut pooled);
+        let mut audio_emb = self.embed_audio(&input.audio_samples, seq)?;
+        let audio_dim = audio_emb.len();
+        if !audio_emb.is_empty() {
+            l2_normalize(&mut audio_emb);
+        }
+
+        // Concatenate [video || audio] per PRD §5.2.
+        let mut embedding = video_emb;
+        embedding.extend_from_slice(&audio_emb);
+        l2_normalize(&mut embedding);
+
+        let k = input.frames.len();
+        let audio_secs = if !input.audio_samples.is_empty() {
+            input.audio_samples.len() as f32 / crate::audio::SAMPLE_RATE as f32
+        } else {
+            0.0
+        };
+        let caption = Some(format!(
+            "gemma-4 chunk: {k} frames, {audio_secs:.1}s audio"
+        ));
 
         Ok(EmbeddingOutput {
-            embedding: pooled,
-            caption: Some(format!(
-                "gemma-4 img {}x{} patches={}",
-                frame.width,
-                frame.height,
-                raw.len() / GEMMA4_HIDDEN_DIM
-            )),
+            embedding,
+            video_dim,
+            audio_dim,
+            caption,
         })
     }
 }
 
 // --- Synthetic (no model / no camera) -------------------------------
 
-/// Fallback that works without Cactus or a webcam. Used by tests and by
-/// the follower binary when `--synthetic` is passed.
 pub struct SyntheticEmbedder {
     dim: usize,
 }
@@ -166,15 +229,30 @@ impl Embedder for SyntheticEmbedder {
         self.dim
     }
 
-    fn embed_frame(&self, _frame: &CapturedFrame, seq: u64) -> Result<EmbeddingOutput> {
+    fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
         let mut rng = StdRng::seed_from_u64(Self::seed(seq));
-        let mut v = vec![0f32; self.dim];
+        // Video portion.
+        let video_dim = self.dim;
+        let mut v = vec![0f32; video_dim];
         for slot in &mut v {
             *slot = (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0;
         }
+        // Audio portion — only if audio was provided.
+        let audio_dim = if input.audio_samples.is_empty() {
+            0
+        } else {
+            self.dim
+        };
+        let mut a = vec![0f32; audio_dim];
+        for slot in &mut a {
+            *slot = (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        }
+        v.extend_from_slice(&a);
         l2_normalize(&mut v);
         Ok(EmbeddingOutput {
             embedding: v,
+            video_dim,
+            audio_dim,
             caption: Some(format!("synthetic #{seq}")),
         })
     }
@@ -184,19 +262,40 @@ impl Embedder for SyntheticEmbedder {
 mod tests {
     use super::*;
 
-    fn dummy_frame() -> CapturedFrame {
-        CapturedFrame {
+    fn dummy_chunk(with_audio: bool) -> ChunkInput {
+        let frame = CapturedFrame {
             width: 4,
             height: 4,
             rgb: Arc::new(vec![0u8; 4 * 4 * 3]),
+        };
+        ChunkInput {
+            frames: vec![frame.clone(), frame.clone(), frame.clone(), frame],
+            audio_samples: if with_audio {
+                vec![0.0f32; 16000 * 5] // 5 s at 16 kHz
+            } else {
+                Vec::new()
+            },
         }
     }
 
     #[test]
     fn synthetic_embedding_is_l2_normalized() {
         let e = SyntheticEmbedder::new(128);
-        let out = e.embed_frame(&dummy_frame(), 0).unwrap();
+        let out = e.embed_chunk(&dummy_chunk(false), 0).unwrap();
         assert_eq!(out.embedding.len(), 128);
+        assert_eq!(out.video_dim, 128);
+        assert_eq!(out.audio_dim, 0);
+        let norm: f32 = out.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn synthetic_with_audio_has_both_dims() {
+        let e = SyntheticEmbedder::new(128);
+        let out = e.embed_chunk(&dummy_chunk(true), 0).unwrap();
+        assert_eq!(out.embedding.len(), 256);
+        assert_eq!(out.video_dim, 128);
+        assert_eq!(out.audio_dim, 128);
         let norm: f32 = out.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4);
     }
@@ -204,16 +303,16 @@ mod tests {
     #[test]
     fn synthetic_embedding_is_deterministic() {
         let e = SyntheticEmbedder::new(16);
-        let a = e.embed_frame(&dummy_frame(), 42).unwrap();
-        let b = e.embed_frame(&dummy_frame(), 42).unwrap();
+        let a = e.embed_chunk(&dummy_chunk(false), 42).unwrap();
+        let b = e.embed_chunk(&dummy_chunk(false), 42).unwrap();
         assert_eq!(a.embedding, b.embedding);
     }
 
     #[test]
     fn synthetic_embedding_differs_across_seq() {
         let e = SyntheticEmbedder::new(16);
-        let a = e.embed_frame(&dummy_frame(), 0).unwrap();
-        let b = e.embed_frame(&dummy_frame(), 1).unwrap();
+        let a = e.embed_chunk(&dummy_chunk(false), 0).unwrap();
+        let b = e.embed_chunk(&dummy_chunk(false), 1).unwrap();
         assert_ne!(a.embedding, b.embedding);
     }
 }

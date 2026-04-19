@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 use crate::camera::CapturedFrame;
+use crate::embedder::{ChunkInput, EmbeddingOutput};
 use crate::frame_buffer::FrameBuffer;
 use crate::gemini_client::GeminiEmbedClient;
 
@@ -27,6 +28,57 @@ pub struct GeminiVideoEmbedder {
 
 pub struct SyntheticVideoEmbedder {
     dim: usize,
+}
+
+/// Implements the synchronous `Embedder` trait using the Gemini REST API.
+/// Designed to be called from `tokio::task::spawn_blocking`.
+pub struct GeminiEmbedder {
+    client: GeminiEmbedClient,
+    jpeg_quality: u8,
+}
+
+impl GeminiEmbedder {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            client: GeminiEmbedClient::new(api_key),
+            jpeg_quality: 80,
+        }
+    }
+}
+
+impl crate::embedder::Embedder for GeminiEmbedder {
+    fn dim(&self) -> usize {
+        0
+    }
+
+    fn embed_chunk(&self, input: &ChunkInput, _seq: u64) -> Result<EmbeddingOutput> {
+        let b64_frames: Vec<String> = input
+            .frames
+            .iter()
+            .map(|f| GeminiVideoEmbedder::encode_jpeg_b64(f, self.jpeg_quality))
+            .collect::<Result<Vec<_>>>()?;
+
+        anyhow::ensure!(!b64_frames.is_empty(), "no frames to embed");
+
+        let n = b64_frames.len();
+        let handle = tokio::runtime::Handle::current();
+        let mut embedding = handle.block_on(self.client.embed(b64_frames))?;
+
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in embedding.iter_mut() {
+                *x /= norm;
+            }
+        }
+
+        let video_dim = embedding.len();
+        Ok(EmbeddingOutput {
+            embedding,
+            video_dim,
+            audio_dim: 0,
+            caption: Some(format!("gemini frames={n}")),
+        })
+    }
 }
 
 fn l2_normalize(v: &mut [f32]) {

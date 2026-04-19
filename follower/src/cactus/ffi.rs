@@ -52,6 +52,17 @@ unsafe extern "C" {
         dim_out: *mut usize,
     ) -> c_int;
 
+    /// Audio embedding. `audio_path` is a filesystem path to a WAV file
+    /// (16 kHz mono PCM expected). Returns the pre-pooled audio
+    /// representation; callers mean-pool and L2-normalize downstream.
+    pub fn cactus_audio_embed(
+        model: CactusModel,
+        audio_path: *const c_char,
+        buf: *mut c_float,
+        buf_size: usize,
+        dim_out: *mut usize,
+    ) -> c_int;
+
     /// Last error message set by any of the above calls. Pointer is
     /// owned by the lib; do not free. Valid until the next FFI call.
     pub fn cactus_get_last_error() -> *const c_char;

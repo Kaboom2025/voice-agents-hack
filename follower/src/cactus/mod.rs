@@ -149,6 +149,40 @@ impl CactusModel {
         buf.truncate(dim);
         Ok(buf)
     }
+
+    /// Embed an audio file on disk. The path must be a WAV file (16 kHz
+    /// mono PCM). Returns the raw pre-pooled audio representation.
+    pub fn embed_audio(&self, audio_path: &Path) -> Result<Vec<f32>> {
+        let path_cstr = CString::new(
+            audio_path
+                .to_str()
+                .context("audio path is not valid utf-8")?,
+        )?;
+        let mut buf = vec![0f32; EMBED_BUF_LEN];
+        let mut dim: usize = 0;
+
+        let rc = {
+            let guard = self.inner.lock().unwrap();
+            // SAFETY: mutex-held, handle non-null, buf/dim valid.
+            unsafe {
+                ffi::cactus_audio_embed(
+                    guard.0,
+                    path_cstr.as_ptr(),
+                    buf.as_mut_ptr(),
+                    EMBED_BUF_BYTES,
+                    &mut dim,
+                )
+            }
+        };
+        if rc < 0 {
+            return Err(anyhow!(
+                "cactus_audio_embed rc={rc}: {}",
+                last_error().unwrap_or_else(|| "<no error message>".into())
+            ));
+        }
+        buf.truncate(dim);
+        Ok(buf)
+    }
 }
 
 fn last_error() -> Option<String> {

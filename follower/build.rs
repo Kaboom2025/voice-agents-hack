@@ -17,9 +17,14 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Load .env from the workspace root (one level up from this crate).
+    // Real env vars always win over .env values.
+    let _ = dotenvy::from_filename("../.env");
+
     // Only the FFI surface depends on the C lib; other files don't need
     // a rebuild when we re-run build.rs.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../.env");
     println!("cargo:rerun-if-env-changed=CACTUS_PREFIX");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CACTUS");
 

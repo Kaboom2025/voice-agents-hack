@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use common::{read_frame, write_frame, FollowerMsg, LeaderMsg, INGEST_ALPN};
 use follower::camera::CapturedFrame;
-use follower::embedder::{Embedder, SyntheticEmbedder};
+use follower::embedder::{ChunkInput, Embedder, SyntheticEmbedder};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -44,8 +44,7 @@ impl ProtocolHandler for TapHandler {
                                     write_frame(&mut send, &LeaderMsg::Ack { chunk_id: id }).await;
                             }
                             FollowerMsg::Bye => return,
-                            FollowerMsg::FrameResponse { .. } => {}
-                            FollowerMsg::FrameError { .. } => {}
+                            FollowerMsg::FrameResponse { .. } | FollowerMsg::FrameError { .. } => {}
                         }
                     }
                 });
@@ -92,13 +91,19 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
     };
     const WANT: u64 = 3;
     for seq in 0..WANT {
-        let out = embedder.embed_frame(&dummy, seq).unwrap();
+        let input = ChunkInput {
+            frames: vec![dummy.clone(); 4],
+            audio_samples: Vec::new(),
+        };
+        let out = embedder.embed_chunk(&input, seq).unwrap();
         let chunk = common::EmbeddingChunk {
             chunk_id: format!("cam-test-{seq}"),
             camera_id: "cam-test".into(),
             start_ts_ms: 0,
             end_ts_ms: 0,
             embedding: out.embedding,
+            video_dim: out.video_dim,
+            audio_dim: out.audio_dim,
             caption: out.caption,
         };
         write_frame(&mut send, &FollowerMsg::Chunk(chunk))
