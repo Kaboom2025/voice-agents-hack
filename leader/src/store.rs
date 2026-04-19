@@ -1,14 +1,9 @@
 use std::sync::RwLock;
 use common::EmbeddingChunk;
 
+#[derive(Clone)]
 pub struct StoredChunk {
     pub chunk: EmbeddingChunk,
-}
-
-impl Clone for StoredChunk {
-    fn clone(&self) -> Self {
-        Self { chunk: self.chunk.clone() }
-    }
 }
 
 pub struct QueryFilter {
@@ -32,7 +27,7 @@ impl EmbeddingStore {
     }
 
     pub fn push(&self, chunk: EmbeddingChunk) {
-        let mut chunks = self.chunks.write().expect("store poisoned");
+        let mut chunks = self.chunks.write().unwrap_or_else(|e| e.into_inner());
         chunks.push(StoredChunk { chunk });
         if chunks.len() > self.max_size {
             chunks.remove(0);
@@ -40,7 +35,7 @@ impl EmbeddingStore {
     }
 
     pub fn query(&self, filter: &QueryFilter) -> Vec<StoredChunk> {
-        let chunks = self.chunks.read().expect("store poisoned");
+        let chunks = self.chunks.read().unwrap_or_else(|e| e.into_inner());
         let mut matched: Vec<StoredChunk> = chunks
             .iter()
             .filter(|sc| {
@@ -69,7 +64,7 @@ impl EmbeddingStore {
     }
 
     pub fn len(&self) -> usize {
-        self.chunks.read().expect("store poisoned").len()
+        self.chunks.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
