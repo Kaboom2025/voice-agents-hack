@@ -21,6 +21,13 @@ fn main() {
     // a rebuild when we re-run build.rs.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CACTUS_PREFIX");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CACTUS");
+
+    // The cactus FFI module is feature-gated; without the feature there's
+    // nothing referring to libcactus, so don't try to link it.
+    if std::env::var_os("CARGO_FEATURE_CACTUS").is_none() {
+        return;
+    }
 
     let prefix: PathBuf = std::env::var_os("CACTUS_PREFIX")
         .map(PathBuf::from)

@@ -9,7 +9,9 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
-cactus-sys = { path = "/Users/pmahey/Documents/cactus/rust/cactus-sys" }
+# cactus-sys lives in a sibling repo; uncomment + fix the path when you want
+# the leader to load Gemma 4 for chunk captioning.
+# cactus-sys = { path = "../cactus/rust/cactus-sys" }
 clap = { version = "4", features = ["derive", "env"] }
 data-encoding = "2"
 dotenvy = "0.15"

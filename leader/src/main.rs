@@ -1,28 +1,47 @@
 //! Leader: accepts ingest connections from any number of followers, prints
 //! a ticket on startup, and logs every chunk it receives.
 //!
-//! When `--model-path` is set (or `CACTUS_MODEL_PATH` env var), the leader
-//! loads Gemma 4 via cactus-sys and can caption / summarise incoming chunks.
+//! Exposes an axum HTTP server (default `127.0.0.1:8080`) for the UI:
+//! - `GET /api/cameras`        — list registered followers + status
+//! - `GET /api/live/:camera_id` — JPEG snapshot fetched on-demand from the
+//!   follower over the existing iroh connection.
+//!
+//! Gemma-4 captioning (formerly behind `--model-path`) is temporarily
+//! disabled — see `leader/src/cactus_llm.rs`. Re-add `cactus-sys` to the
+//! workspace + this binary to bring it back.
 
-mod cactus_llm;
+// mod cactus_llm; // disabled: cactus-sys workspace dep is unavailable
 
 use std::{
+    collections::HashMap,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use axum::{
+    extract::{Path as AxPath, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
 use clap::Parser;
 use common::{read_frame, write_frame, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN};
 use iroh::{
     endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
+    protocol::{AcceptError, ProtocolHandler, Router as IrohRouter},
     Endpoint, SecretKey, Watcher,
 };
-use tracing::{error, info, warn};
+use serde::Serialize;
+use tokio::sync::{mpsc, oneshot};
+use tower_http::cors::{Any, CorsLayer};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(about = "iroh leader: accepts data from followers")]
@@ -42,10 +61,13 @@ struct Args {
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
 
-    /// Path to the Cactus model weights directory (e.g. gemma-4-e2b-it).
-    /// When set, the leader loads Gemma 4 on startup and can caption chunks.
-    #[arg(long, env = "CACTUS_MODEL_PATH")]
-    model_path: Option<PathBuf>,
+    /// Address to bind the HTTP server the UI talks to.
+    #[arg(long, env = "LEADER_HTTP_ADDR", default_value = "127.0.0.1:8080")]
+    http_addr: SocketAddr,
+
+    /// How long to wait for a follower's frame response before giving up.
+    #[arg(long, default_value_t = 2000)]
+    frame_timeout_ms: u64,
 }
 
 #[tokio::main]
@@ -85,35 +107,38 @@ async fn main() -> Result<()> {
     println!("\n  leader ready");
     println!("  endpoint id: {id}");
     println!("  ticket file: {}", args.ticket_file.display());
+    println!("  http on:     http://{}", args.http_addr);
     println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
 
-    // Optionally load Gemma 4 via cactus-sys.
-    let model = match &args.model_path {
-        Some(path) => {
-            info!(path = %path.display(), "loading Gemma 4 model via cactus …");
-            let m = cactus_llm::CactusModel::load(path, None)
-                .with_context(|| format!("failed to load model from {}", path.display()))?;
-            info!("Gemma 4 model loaded");
-            Some(Arc::new(m))
-        }
-        None => {
-            info!("no --model-path set, running without LLM");
-            None
-        }
+    // Shared state used by both the iroh ingest handler and the HTTP server.
+    let app_state = AppState {
+        registry: Arc::new(RwLock::new(HashMap::new())),
+        next_req_id: Arc::new(AtomicU64::new(1)),
+        chunks_total: Arc::new(AtomicU64::new(0)),
+        frame_timeout: Duration::from_millis(args.frame_timeout_ms),
     };
 
     let handler = IngestHandler {
-        chunks_total: Arc::new(AtomicU64::new(0)),
-        model: model.clone(),
+        state: app_state.clone(),
     };
-    let router = Router::builder(endpoint)
+    let iroh_router = IrohRouter::builder(endpoint)
         .accept(INGEST_ALPN, handler)
         .spawn();
+
+    // Spawn the HTTP server in the background.
+    let http_state = app_state.clone();
+    let http_addr = args.http_addr;
+    let http_task = tokio::spawn(async move {
+        if let Err(e) = serve_http(http_addr, http_state).await {
+            error!(%e, "http server exited with error");
+        }
+    });
 
     wait_for_shutdown().await?;
     info!("shutting down");
     let _ = std::fs::remove_file(&args.ticket_file);
-    router.shutdown().await?;
+    http_task.abort();
+    iroh_router.shutdown().await?;
     Ok(())
 }
 
@@ -122,7 +147,7 @@ async fn main() -> Result<()> {
 async fn wait_for_shutdown() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate())?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
@@ -173,10 +198,68 @@ fn load_or_create_key(path: &Path) -> Result<SecretKey> {
     }
 }
 
+// ──────────────────────────── shared state ────────────────────────────
+
+/// Live registration entry per camera. Created on `Hello`, removed on
+/// follower disconnect. The `request_tx` lets the HTTP layer push frame
+/// requests at the iroh task that owns the bidi stream.
+#[derive(Clone)]
+struct CameraEntry {
+    request_tx: mpsc::Sender<FrameReq>,
+    follower_node_id: String,
+    last_seen_ms: Arc<AtomicU64>,
+    chunks_total: Arc<AtomicU64>,
+    connected_at_ms: u64,
+}
+
+struct FrameReq {
+    req_id: u64,
+    response_tx: oneshot::Sender<FrameOutcome>,
+}
+
+enum FrameOutcome {
+    Ok(FrameSnapshot),
+    Err(String),
+}
+
+struct FrameSnapshot {
+    jpeg: Vec<u8>,
+    #[allow(dead_code)]
+    width: u32,
+    #[allow(dead_code)]
+    height: u32,
+    #[allow(dead_code)]
+    ts_ms: u64,
+}
+
+#[derive(Clone)]
+struct AppState {
+    registry: Arc<RwLock<HashMap<String, CameraEntry>>>,
+    next_req_id: Arc<AtomicU64>,
+    chunks_total: Arc<AtomicU64>,
+    frame_timeout: Duration,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ──────────────────────────── iroh handler ────────────────────────────
+
 #[derive(Debug, Clone)]
 struct IngestHandler {
-    chunks_total: Arc<AtomicU64>,
-    model: Option<Arc<cactus_llm::CactusModel>>,
+    state: AppState,
+}
+
+// AppState contains an RwLock + Arc<AtomicU64>; not Debug. Hand-roll Debug
+// for the State field of IngestHandler.
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState").finish_non_exhaustive()
+    }
 }
 
 impl ProtocolHandler for IngestHandler {
@@ -187,7 +270,7 @@ impl ProtocolHandler for IngestHandler {
             .unwrap_or_else(|_| "<unknown>".to_string());
         info!(%remote, "follower connected");
 
-        if let Err(err) = self.serve(conn).await {
+        if let Err(err) = self.serve(conn, remote.clone()).await {
             warn!(%remote, %err, "follower session ended with error");
         } else {
             info!(%remote, "follower disconnected");
@@ -197,104 +280,251 @@ impl ProtocolHandler for IngestHandler {
 }
 
 impl IngestHandler {
-    async fn serve(&self, conn: Connection) -> Result<()> {
-        // We expect a single bidirectional stream per follower, opened by the
-        // follower. Multiple streams per connection are fine — just loop.
+    async fn serve(&self, conn: Connection, remote: String) -> Result<()> {
         loop {
-            let (mut send, mut recv) = match conn.accept_bi().await {
+            let (send, recv) = match conn.accept_bi().await {
                 Ok(s) => s,
                 Err(_) => return Ok(()), // connection closed
             };
 
-            let counter = self.chunks_total.clone();
-            let model = self.model.clone();
+            let state = self.state.clone();
+            let remote = remote.clone();
             tokio::spawn(async move {
-                let mut camera = String::from("<unknown>");
-                loop {
-                    let msg: Option<FollowerMsg> = match read_frame(&mut recv).await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            warn!(%e, "read failed");
-                            return;
-                        }
-                    };
-                    let Some(msg) = msg else { return };
-                    match msg {
-                        FollowerMsg::Hello { camera_id } => {
-                            info!(%camera_id, "hello");
-                            camera = camera_id;
-                        }
-                        FollowerMsg::Chunk(chunk) => {
-                            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                            info!(
-                                total = n,
-                                camera = %chunk.camera_id,
-                                chunk = %chunk.chunk_id,
-                                dim = chunk.embedding.len(),
-                                caption = chunk.caption.as_deref().unwrap_or(""),
-                                "recv chunk",
-                            );
-
-                            // If we have a loaded Gemma 4 model, generate a
-                            // summary / caption for the incoming chunk.
-                            if let Some(ref m) = model {
-                                let prompt = format!(
-                                    "Camera {} sent a video chunk ({}–{} ms). \
-                                     The follower-side caption is: \"{}\". \
-                                     Provide a one-sentence summary.",
-                                    chunk.camera_id,
-                                    chunk.start_ts_ms,
-                                    chunk.end_ts_ms,
-                                    chunk.caption.as_deref().unwrap_or("(none)"),
-                                );
-                                let messages = serde_json::json!([
-                                    {"role": "user", "content": prompt}
-                                ]);
-                                let options = serde_json::json!({
-                                    "max_tokens": 128
-                                });
-                                let chunk_id = chunk.chunk_id.clone();
-                                let m = m.clone();
-                                let msgs_str = messages.to_string();
-                                let opts_str = options.to_string();
-                                // Run inference on a blocking thread so we
-                                // don't stall the tokio runtime.
-                                tokio::task::spawn_blocking(move || {
-                                    match m.complete(&msgs_str, Some(&opts_str)) {
-                                        Ok(resp) => {
-                                            info!(
-                                                chunk = %chunk_id,
-                                                gemma4_response = %resp,
-                                                "LLM caption",
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                chunk = %chunk_id,
-                                                %e,
-                                                "Gemma 4 completion failed",
-                                            );
-                                        }
-                                    }
-                                });
-                            }
-
-                            // TODO: persist to ChromaDB / SQLite.
-                            let ack = LeaderMsg::Ack {
-                                chunk_id: chunk.chunk_id,
-                            };
-                            if let Err(e) = write_frame(&mut send, &ack).await {
-                                error!(%e, "ack write failed");
-                                return;
-                            }
-                        }
-                        FollowerMsg::Bye => {
-                            info!(%camera, "bye");
-                            return;
-                        }
-                    }
+                if let Err(e) = serve_stream(send, recv, state, remote.clone()).await {
+                    warn!(%remote, %e, "stream task ended with error");
                 }
             });
         }
+    }
+}
+
+/// Owns one bidi stream and multiplexes:
+/// - inbound `FollowerMsg` (Hello / Chunk / FrameResponse / FrameError / Bye)
+/// - outbound `LeaderMsg` (Ack / FrameRequest), driven by:
+///   - chunk acks fired from the same loop
+///   - frame requests pushed by HTTP handlers via `mpsc`
+async fn serve_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    state: AppState,
+    remote: String,
+) -> Result<()> {
+    let (req_tx, mut req_rx) = mpsc::channel::<FrameReq>(64);
+    let mut pending: HashMap<u64, oneshot::Sender<FrameOutcome>> = HashMap::new();
+    let mut camera_id: Option<String> = None;
+    let mut entry: Option<CameraEntry> = None;
+
+    loop {
+        tokio::select! {
+            // Inbound traffic from the follower.
+            msg = read_frame::<_, FollowerMsg>(&mut recv) => {
+                let msg = match msg {
+                    Ok(Some(m)) => m,
+                    Ok(None) => break,
+                    Err(e) => { warn!(%e, "stream read failed"); break; }
+                };
+                match msg {
+                    FollowerMsg::Hello { camera_id: cid } => {
+                        info!(camera_id = %cid, %remote, "hello");
+                        let new_entry = CameraEntry {
+                            request_tx: req_tx.clone(),
+                            follower_node_id: remote.clone(),
+                            last_seen_ms: Arc::new(AtomicU64::new(now_ms())),
+                            chunks_total: Arc::new(AtomicU64::new(0)),
+                            connected_at_ms: now_ms(),
+                        };
+                        state
+                            .registry
+                            .write()
+                            .expect("registry poisoned")
+                            .insert(cid.clone(), new_entry.clone());
+                        camera_id = Some(cid);
+                        entry = Some(new_entry);
+                    }
+                    FollowerMsg::Chunk(chunk) => {
+                        let n = state.chunks_total.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(e) = entry.as_ref() {
+                            e.chunks_total.fetch_add(1, Ordering::Relaxed);
+                            e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                        info!(
+                            total = n,
+                            camera = %chunk.camera_id,
+                            chunk = %chunk.chunk_id,
+                            dim = chunk.embedding.len(),
+                            caption = chunk.caption.as_deref().unwrap_or(""),
+                            "recv chunk",
+                        );
+                        let ack = LeaderMsg::Ack { chunk_id: chunk.chunk_id };
+                        if let Err(e) = write_frame(&mut send, &ack).await {
+                            error!(%e, "ack write failed");
+                            break;
+                        }
+                    }
+                    FollowerMsg::FrameResponse { req_id, ts_ms, width, height, jpeg } => {
+                        if let Some(e) = entry.as_ref() {
+                            e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
+                        }
+                        if let Some(tx) = pending.remove(&req_id) {
+                            let _ = tx.send(FrameOutcome::Ok(FrameSnapshot {
+                                jpeg, width, height, ts_ms,
+                            }));
+                        } else {
+                            debug!(req_id, "frame response with no waiter (timed out?)");
+                        }
+                    }
+                    FollowerMsg::FrameError { req_id, message } => {
+                        if let Some(tx) = pending.remove(&req_id) {
+                            let _ = tx.send(FrameOutcome::Err(message));
+                        }
+                    }
+                    FollowerMsg::Bye => {
+                        if let Some(cid) = &camera_id {
+                            info!(camera = %cid, "bye");
+                        }
+                        break;
+                    }
+                }
+            }
+            // Outbound: HTTP layer asked for a frame.
+            Some(req) = req_rx.recv() => {
+                pending.insert(req.req_id, req.response_tx);
+                if let Err(e) = write_frame(&mut send, &LeaderMsg::FrameRequest { req_id: req.req_id }).await {
+                    warn!(%e, "frame request write failed");
+                    if let Some(tx) = pending.remove(&req.req_id) {
+                        let _ = tx.send(FrameOutcome::Err(format!("write failed: {e}")));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Cleanup: drop the registration so HTTP requests stop landing here, and
+    // cancel any pending oneshots so callers see an error instead of hanging.
+    if let Some(cid) = &camera_id {
+        let mut reg = state.registry.write().expect("registry poisoned");
+        if let Some(existing) = reg.get(cid) {
+            if Arc::ptr_eq(&existing.last_seen_ms, &entry.as_ref().unwrap().last_seen_ms) {
+                reg.remove(cid);
+                info!(camera = %cid, "deregistered");
+            }
+        }
+    }
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(FrameOutcome::Err("follower disconnected".into()));
+    }
+    Ok(())
+}
+
+// ──────────────────────────── HTTP layer ─────────────────────────────
+
+async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/api/cameras", get(list_cameras))
+        .route("/api/live/:camera_id", get(live_jpg))
+        .layer(cors)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind http {addr}"))?;
+    info!(%addr, "http server listening");
+    axum::serve(listener, app).await.context("axum serve")?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct CameraJson {
+    id: String,
+    follower_node_id: String,
+    status: &'static str,
+    last_seen_ms: u64,
+    chunks_per_min: f64,
+}
+
+async fn list_cameras(State(state): State<AppState>) -> Json<Vec<CameraJson>> {
+    let now = now_ms();
+    let reg = state.registry.read().expect("registry poisoned");
+    let mut out: Vec<CameraJson> = reg
+        .iter()
+        .map(|(id, e)| {
+            let last_seen = e.last_seen_ms.load(Ordering::Relaxed);
+            let age_ms = now.saturating_sub(last_seen);
+            let status = if age_ms < 30_000 {
+                "online"
+            } else if age_ms < 120_000 {
+                "degraded"
+            } else {
+                "offline"
+            };
+            let elapsed_min =
+                ((now.saturating_sub(e.connected_at_ms)) as f64 / 60_000.0).max(1.0 / 60.0);
+            let chunks = e.chunks_total.load(Ordering::Relaxed) as f64;
+            CameraJson {
+                id: id.clone(),
+                follower_node_id: e.follower_node_id.clone(),
+                status,
+                last_seen_ms: last_seen,
+                chunks_per_min: chunks / elapsed_min,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(out)
+}
+
+async fn live_jpg(
+    State(state): State<AppState>,
+    AxPath(camera_id): AxPath<String>,
+) -> Response {
+    let req_tx = {
+        let reg = state.registry.read().expect("registry poisoned");
+        match reg.get(&camera_id) {
+            Some(e) => e.request_tx.clone(),
+            None => {
+                return (StatusCode::NOT_FOUND, format!("camera '{camera_id}' not online"))
+                    .into_response();
+            }
+        }
+    };
+
+    let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
+    let (otx, orx) = oneshot::channel();
+    if req_tx
+        .send(FrameReq { req_id, response_tx: otx })
+        .await
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "follower request channel closed",
+        )
+            .into_response();
+    }
+
+    match tokio::time::timeout(state.frame_timeout, orx).await {
+        Ok(Ok(FrameOutcome::Ok(snap))) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            ],
+            snap.jpeg,
+        )
+            .into_response(),
+        Ok(Ok(FrameOutcome::Err(msg))) => {
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
+        Ok(Err(_recv_err)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "follower closed before frame arrived",
+        )
+            .into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "frame request timed out").into_response(),
     }
 }

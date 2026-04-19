@@ -2,14 +2,31 @@
 //! calling real Cactus/Gemma or producing a deterministic synthetic
 //! vector — the transport layer doesn't know or care.
 
+#[cfg(feature = "cactus")]
 use std::path::Path;
+#[cfg(any(feature = "cactus", test))]
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "cactus")]
+use anyhow::Context;
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
+#[cfg(feature = "cactus")]
 use crate::cactus::{l2_normalize, mean_pool, CactusModel};
 use crate::camera::CapturedFrame;
+
+// Local copy of l2_normalize so the synthetic path doesn't depend on the
+// cactus module (which is feature-gated and may not be compiled in).
+#[cfg(not(feature = "cactus"))]
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
 
 /// Gemma-4-E2B hidden dimension — target for mean-pooled image embeddings.
 /// Chosen so image vectors match text embed dim for hybrid retrieval.
@@ -32,6 +49,7 @@ pub struct EmbeddingOutput {
 
 // --- Cactus-backed embedder -----------------------------------------
 
+#[cfg(feature = "cactus")]
 pub struct CactusEmbedder {
     model: Arc<CactusModel>,
     tmp_dir: std::path::PathBuf,
@@ -39,6 +57,7 @@ pub struct CactusEmbedder {
     jpeg_quality: u8,
 }
 
+#[cfg(feature = "cactus")]
 impl CactusEmbedder {
     /// Create with a loaded Cactus model. JPEG intermediates are written
     /// to `std::env::temp_dir()` by default; override with [`with_tmp_dir`].
@@ -85,6 +104,7 @@ impl CactusEmbedder {
     }
 }
 
+#[cfg(feature = "cactus")]
 impl Embedder for CactusEmbedder {
     fn dim(&self) -> usize {
         0

@@ -44,6 +44,22 @@ pub enum FollowerMsg {
         camera_id: String,
     },
     Chunk(EmbeddingChunk),
+    /// JPEG snapshot returned in response to a `LeaderMsg::FrameRequest`.
+    /// Carries the latest captured frame from the follower's webcam, encoded
+    /// as JPEG so the leader can serve it directly to HTTP clients.
+    FrameResponse {
+        req_id: u64,
+        ts_ms: u64,
+        width: u32,
+        height: u32,
+        jpeg: Vec<u8>,
+    },
+    /// Sent in place of `FrameResponse` when the follower has no frame
+    /// available (camera not yet ready, encode failed, etc).
+    FrameError {
+        req_id: u64,
+        message: String,
+    },
     /// Graceful shutdown signal.
     Bye,
 }
@@ -53,6 +69,10 @@ pub enum FollowerMsg {
 pub enum LeaderMsg {
     /// Acknowledges receipt + persistence of a chunk by id.
     Ack { chunk_id: String },
+    /// Asks the follower to send back its latest webcam frame as JPEG.
+    /// The follower's response carries the same `req_id` so the leader can
+    /// route it back to the waiting HTTP request.
+    FrameRequest { req_id: u64 },
 }
 
 /// Connection ticket: everything a follower needs to reach the leader.

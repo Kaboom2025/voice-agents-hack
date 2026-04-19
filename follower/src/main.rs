@@ -14,11 +14,15 @@ use clap::Parser;
 use common::{
     read_frame, write_frame, EmbeddingChunk, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN,
 };
+#[cfg(feature = "cactus")]
 use follower::cactus::CactusModel;
 use follower::camera::{self, CapturedFrame};
-use follower::embedder::{CactusEmbedder, Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
+#[cfg(feature = "cactus")]
+use follower::embedder::CactusEmbedder;
+use follower::embedder::{Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
 use iroh::Endpoint;
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(about = "iroh follower: capture webcam, embed via Gemma-4, push to leader")]
@@ -83,7 +87,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let ticket_str = match args.ticket {
+    let ticket_str = match args.ticket.clone() {
         Some(t) => t,
         None => std::fs::read_to_string(&args.ticket_file)
             .with_context(|| {
@@ -107,20 +111,25 @@ async fn main() -> Result<()> {
     info!("connected");
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    write_frame(
-        &mut send,
-        &FollowerMsg::Hello {
-            camera_id: args.camera_id.clone(),
-        },
-    )
-    .await?;
-
-    // Background ack drain.
-    let ack_task = tokio::spawn(async move {
-        while let Ok(Some(LeaderMsg::Ack { chunk_id })) = read_frame(&mut recv).await {
-            tracing::debug!(%chunk_id, "ack");
+    // All outbound frames flow through this channel so the chunk loop and
+    // the on-demand frame-request handler don't race for the send half.
+    let (writer_tx, mut writer_rx) = mpsc::channel::<FollowerMsg>(128);
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = writer_rx.recv().await {
+            if let Err(e) = write_frame(&mut send, &msg).await {
+                warn!(%e, "writer: send failed");
+                break;
+            }
         }
+        let _ = send.finish();
     });
+
+    writer_tx
+        .send(FollowerMsg::Hello {
+            camera_id: args.camera_id.clone(),
+        })
+        .await
+        .context("send hello")?;
 
     // Ensure the frame directory exists before the first write.
     std::fs::create_dir_all(&args.frame_dir)
@@ -128,36 +137,9 @@ async fn main() -> Result<()> {
     info!(dir = %args.frame_dir.display(), "saving frames");
 
     // --- Build the embedder --------------------------------------
-    let embedder: Arc<dyn Embedder> = if args.synthetic {
-        info!("embedder: synthetic (flag)");
-        Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM))
-    } else {
-        // Loading Gemma-4 blocks for ~5s. Don't block the reactor.
-        let model_path = args.model_path.clone();
-        let model = tokio::task::spawn_blocking(move || CactusModel::new(&model_path))
-            .await
-            .context("join cactus init")?;
-        match model {
-            Ok(m) => {
-                info!(path = %args.model_path.display(), "cactus gemma-4 loaded");
-                Arc::new(
-                    CactusEmbedder::new(Arc::new(m))
-                        .with_tmp_dir(args.frame_dir.clone())
-                        .with_file_prefix(args.camera_id.clone()),
-                )
-            }
-            Err(e) => {
-                warn!(error = %e, "cactus init failed, falling back to synthetic");
-                Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM))
-            }
-        }
-    };
+    let embedder: Arc<dyn Embedder> = build_embedder(&args).await?;
 
     // --- Build the frame source ----------------------------------
-    enum FrameSource {
-        Cam(tokio::sync::watch::Receiver<Option<CapturedFrame>>),
-        Still(CapturedFrame),
-    }
     let frames = if args.no_camera {
         info!("frame source: solid placeholder");
         FrameSource::Still(solid_placeholder())
@@ -174,6 +156,59 @@ async fn main() -> Result<()> {
         }
     };
 
+    // --- Reader task: drain LeaderMsg, serve FrameRequests --------
+    let frames_for_reader = frames.clone();
+    let writer_for_reader = writer_tx.clone();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let msg: Option<LeaderMsg> = match read_frame(&mut recv).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(%e, "reader: read failed");
+                    break;
+                }
+            };
+            let Some(msg) = msg else { break };
+            match msg {
+                LeaderMsg::Ack { chunk_id } => debug!(%chunk_id, "ack"),
+                LeaderMsg::FrameRequest { req_id } => {
+                    let frame = frames_for_reader.current();
+                    let writer = writer_for_reader.clone();
+                    tokio::spawn(async move {
+                        let resp = match frame {
+                            Some(f) => match tokio::task::spawn_blocking(move || {
+                                encode_jpeg(&f, 85)
+                            })
+                            .await
+                            {
+                                Ok(Ok((jpeg, w, h))) => FollowerMsg::FrameResponse {
+                                    req_id,
+                                    ts_ms: now_ms(),
+                                    width: w,
+                                    height: h,
+                                    jpeg,
+                                },
+                                Ok(Err(e)) => FollowerMsg::FrameError {
+                                    req_id,
+                                    message: format!("encode failed: {e}"),
+                                },
+                                Err(e) => FollowerMsg::FrameError {
+                                    req_id,
+                                    message: format!("encode task panicked: {e}"),
+                                },
+                            },
+                            None => FollowerMsg::FrameError {
+                                req_id,
+                                message: "no frame available yet".into(),
+                            },
+                        };
+                        let _ = writer.send(resp).await;
+                    });
+                }
+            }
+        }
+    });
+
     // --- Push loop ----------------------------------------------
     let mut interval = tokio::time::interval(Duration::from_millis(args.interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -184,15 +219,12 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = interval.tick() => {
                 // Grab a frame.
-                let frame = match &frames {
-                    FrameSource::Cam(rx) => match rx.borrow().clone() {
-                        Some(f) => f,
-                        None => {
-                            warn!("camera has no frame yet, waiting for next tick");
-                            continue;
-                        }
-                    },
-                    FrameSource::Still(f) => f.clone(),
+                let frame = match frames.current() {
+                    Some(f) => f,
+                    None => {
+                        warn!("camera has no frame yet, waiting for next tick");
+                        continue;
+                    }
                 };
 
                 // Embed on a blocking thread — Cactus on CPU is slow.
@@ -206,21 +238,18 @@ async fn main() -> Result<()> {
                     Err(e) => { warn!(error = %e, "embed task panicked"); continue; }
                 };
 
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                let ts = now_ms();
                 let chunk = EmbeddingChunk {
                     chunk_id: format!("{}-{}", args.camera_id, sent),
                     camera_id: args.camera_id.clone(),
-                    start_ts_ms: now_ms,
-                    end_ts_ms: now_ms + args.interval_ms,
+                    start_ts_ms: ts,
+                    end_ts_ms: ts + args.interval_ms,
                     embedding: out.embedding,
                     caption: out.caption,
                 };
                 let dim = chunk.embedding.len();
-                if let Err(e) = write_frame(&mut send, &FollowerMsg::Chunk(chunk)).await {
-                    warn!(%e, "send failed; exiting");
+                if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
+                    warn!("writer channel closed; exiting");
                     break;
                 }
                 sent += 1;
@@ -236,11 +265,86 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _ = write_frame(&mut send, &FollowerMsg::Bye).await;
-    let _ = send.finish();
-    ack_task.abort();
+    let _ = writer_tx.send(FollowerMsg::Bye).await;
+    drop(writer_tx);
+    let _ = writer_task.await;
+    reader_task.abort();
     endpoint.close().await;
     Ok(())
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "cactus")]
+async fn build_embedder(args: &Args) -> Result<Arc<dyn Embedder>> {
+    if args.synthetic {
+        info!("embedder: synthetic (flag)");
+        return Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)));
+    }
+    let model_path = args.model_path.clone();
+    let model = tokio::task::spawn_blocking(move || CactusModel::new(&model_path))
+        .await
+        .context("join cactus init")?;
+    match model {
+        Ok(m) => {
+            info!(path = %args.model_path.display(), "cactus gemma-4 loaded");
+            Ok(Arc::new(
+                CactusEmbedder::new(Arc::new(m))
+                    .with_tmp_dir(args.frame_dir.clone())
+                    .with_file_prefix(args.camera_id.clone()),
+            ))
+        }
+        Err(e) => {
+            warn!(error = %e, "cactus init failed, falling back to synthetic");
+            Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)))
+        }
+    }
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn build_embedder(_args: &Args) -> Result<Arc<dyn Embedder>> {
+    info!("embedder: synthetic (cactus feature off)");
+    Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)))
+}
+
+/// Encode an in-memory RGB frame to JPEG. Returns `(bytes, width, height)`.
+fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<(Vec<u8>, u32, u32)> {
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
+    let cap = (frame.width as usize) * (frame.height as usize) / 4;
+    let mut buf = Vec::with_capacity(cap.max(64 * 1024));
+    let mut encoder = JpegEncoder::new_with_quality(&mut buf, quality);
+    encoder
+        .encode(
+            frame.rgb.as_slice(),
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgb8,
+        )
+        .context("jpeg encode")?;
+    Ok((buf, frame.width, frame.height))
+}
+
+/// Source of frames for the embed loop and live snapshots. Cloning is cheap:
+/// `watch::Receiver` clones share the underlying channel; `CapturedFrame` is
+/// internally `Arc<Vec<u8>>` so its clone is a single refcount bump.
+#[derive(Clone)]
+enum FrameSource {
+    Cam(tokio::sync::watch::Receiver<Option<CapturedFrame>>),
+    Still(CapturedFrame),
+}
+
+impl FrameSource {
+    fn current(&self) -> Option<CapturedFrame> {
+        match self {
+            FrameSource::Cam(rx) => rx.borrow().clone(),
+            FrameSource::Still(f) => Some(f.clone()),
+        }
+    }
 }
 
 /// 64x64 mid-gray RGB frame used when no camera is available.

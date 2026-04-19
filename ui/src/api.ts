@@ -146,4 +146,41 @@ export const mockClient: ApiClient = {
   },
 };
 
-export const api: ApiClient = mockClient;
+// ────────────────────────── real HTTP client ──────────────────────────
+// Talks to the leader's axum server (proxied through Vite at /api).
+// `liveStream` and `listCameras` are real; query/rpcStream/clipUrl still
+// fall through to the mock until those leader endpoints exist.
+
+export function liveJpegUrl(cameraId: string, cacheBust?: number): string {
+  const t = cacheBust ?? performance.now();
+  return `/api/live/${encodeURIComponent(cameraId)}?t=${t}`;
+}
+
+export const httpClient: ApiClient = {
+  async listCameras() {
+    const res = await fetch("/api/cameras");
+    if (!res.ok) throw new Error(`listCameras: ${res.status}`);
+    return (await res.json()) as Camera[];
+  },
+
+  query: mockClient.query,
+  rpcStream: mockClient.rpcStream,
+
+  // The real live transport is browser-driven `<img>` polling against
+  // `liveJpegUrl(cameraId)`. This generator only emits LiveFrame ticks for
+  // any consumer that wants poster URLs; LiveTile bypasses it.
+  async *liveStream(cameraIds, signal) {
+    while (!signal.aborted) {
+      for (const camera_id of cameraIds) {
+        if (signal.aborted) return;
+        const ts_ms = Date.now();
+        yield { camera_id, ts_ms, poster_url: liveJpegUrl(camera_id, ts_ms) };
+      }
+      await sleep(33);
+    }
+  },
+
+  clipUrl: mockClient.clipUrl,
+};
+
+export const api: ApiClient = httpClient;

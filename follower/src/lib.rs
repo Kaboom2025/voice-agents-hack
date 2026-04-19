@@ -7,6 +7,7 @@
 //! - [`embedder`] — ties the two together behind a trait so the
 //!   synthetic path stays alive for tests / no-camera environments.
 
+#[cfg(feature = "cactus")]
 pub mod cactus;
 pub mod camera;
 pub mod embedder;

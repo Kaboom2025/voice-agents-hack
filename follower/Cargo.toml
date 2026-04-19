@@ -16,6 +16,14 @@ path = "src/main.rs"
 [[example]]
 name = "cactus_smoke"
 path = "examples/cactus_smoke.rs"
+required-features = ["cactus"]
+
+[features]
+# Off by default: building without the cactus C dylib should "just work"
+# and fall back to SyntheticEmbedder. Turn on when libcactus.dylib is
+# installed (e.g. via Homebrew on Apple Silicon).
+default = []
+cactus = []
 
 [dependencies]
 anyhow.workspace = true
