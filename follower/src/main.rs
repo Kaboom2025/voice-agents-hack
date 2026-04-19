@@ -356,7 +356,15 @@ async fn run_session(
         let representative_jpeg = {
             sampled_frames
                 .get(sampled_frames.len() / 2)
-                .and_then(|mid_frame| GeminiVideoEmbedder::encode_jpeg_bytes(mid_frame, 60).ok())
+                .and_then(|mid_frame| {
+                    match GeminiVideoEmbedder::encode_jpeg_bytes(mid_frame, 60) {
+                        Ok(jpeg) => Some(jpeg),
+                        Err(e) => {
+                            warn!(error = %e, "failed to encode representative JPEG");
+                            None
+                        }
+                    }
+                })
         };
 
         // Drain the audio accumulated during this window.
