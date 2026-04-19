@@ -1,6 +1,6 @@
 //! Embedding strategies. The `Embedder` trait hides whether we're
-//! calling real Cactus/Gemma or producing a deterministic synthetic
-//! vector — the transport layer doesn't know or care.
+//! calling Cactus/Gemma locally or the Gemini API — the transport layer
+//! doesn't know or care.
 //!
 //! PRD §5.1: each 5 s chunk samples K=4 evenly-spaced frames and the
 //! audio segment. PRD §5.2: the video embedding is mean-pooled across
@@ -9,30 +9,17 @@
 
 #[cfg(feature = "cactus")]
 use std::path::Path;
-#[cfg(any(feature = "cactus", test))]
+#[cfg(feature = "cactus")]
 use std::sync::Arc;
 
 #[cfg(feature = "cactus")]
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 #[cfg(feature = "cactus")]
 use crate::cactus::{l2_normalize, mean_pool, CactusModel};
 use crate::camera::CapturedFrame;
-
-// Local copy of l2_normalize so the synthetic path doesn't depend on the
-// cactus module (which is feature-gated and may not be compiled in).
-#[cfg(not(feature = "cactus"))]
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
-}
 
 /// Gemma-4-E2B hidden dimension — target for mean-pooled image embeddings.
 /// Chosen so image vectors match text embed dim for hybrid retrieval.
@@ -231,112 +218,4 @@ impl Embedder for CactusEmbedder {
     }
 }
 
-// --- Synthetic (no model / no camera) -------------------------------
 
-pub struct SyntheticEmbedder {
-    dim: usize,
-}
-
-impl SyntheticEmbedder {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-
-    fn seed(seq: u64) -> u64 {
-        seq.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xcbf29ce484222325
-    }
-}
-
-#[async_trait]
-impl Embedder for SyntheticEmbedder {
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    async fn embed_chunk(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
-        let mut rng = StdRng::seed_from_u64(Self::seed(seq));
-        // Video portion.
-        let video_dim = self.dim;
-        let mut v = vec![0f32; video_dim];
-        for slot in &mut v {
-            *slot = (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        }
-        // Audio portion — only if audio was provided.
-        let audio_dim = if input.audio_samples.is_empty() {
-            0
-        } else {
-            self.dim
-        };
-        let mut a = vec![0f32; audio_dim];
-        for slot in &mut a {
-            *slot = (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        }
-        v.extend_from_slice(&a);
-        l2_normalize(&mut v);
-        Ok(EmbeddingOutput {
-            embedding: v,
-            video_dim,
-            audio_dim,
-            caption: Some(format!("synthetic #{seq}")),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn dummy_chunk(with_audio: bool) -> ChunkInput {
-        let frame = CapturedFrame {
-            width: 4,
-            height: 4,
-            rgb: Arc::new(vec![0u8; 4 * 4 * 3]),
-        };
-        ChunkInput {
-            frames: vec![frame.clone(), frame.clone(), frame.clone(), frame],
-            audio_samples: if with_audio {
-                vec![0.0f32; 16000 * 5] // 5 s at 16 kHz
-            } else {
-                Vec::new()
-            },
-        }
-    }
-
-    #[tokio::test]
-    async fn synthetic_embedding_is_l2_normalized() {
-        let e = SyntheticEmbedder::new(128);
-        let out = e.embed_chunk(&dummy_chunk(false), 0).await.unwrap();
-        assert_eq!(out.embedding.len(), 128);
-        assert_eq!(out.video_dim, 128);
-        assert_eq!(out.audio_dim, 0);
-        let norm: f32 = out.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn synthetic_with_audio_has_both_dims() {
-        let e = SyntheticEmbedder::new(128);
-        let out = e.embed_chunk(&dummy_chunk(true), 0).await.unwrap();
-        assert_eq!(out.embedding.len(), 256);
-        assert_eq!(out.video_dim, 128);
-        assert_eq!(out.audio_dim, 128);
-        let norm: f32 = out.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn synthetic_embedding_is_deterministic() {
-        let e = SyntheticEmbedder::new(16);
-        let a = e.embed_chunk(&dummy_chunk(false), 42).await.unwrap();
-        let b = e.embed_chunk(&dummy_chunk(false), 42).await.unwrap();
-        assert_eq!(a.embedding, b.embedding);
-    }
-
-    #[tokio::test]
-    async fn synthetic_embedding_differs_across_seq() {
-        let e = SyntheticEmbedder::new(16);
-        let a = e.embed_chunk(&dummy_chunk(false), 0).await.unwrap();
-        let b = e.embed_chunk(&dummy_chunk(false), 1).await.unwrap();
-        assert_ne!(a.embedding, b.embedding);
-    }
-}

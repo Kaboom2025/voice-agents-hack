@@ -26,6 +26,7 @@ common = { path = "../common" }
 data-encoding.workspace = true
 dotenvy.workspace = true
 iroh.workspace = true
+postcard.workspace = true
 rand.workspace = true
 rand_core_06.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -7,7 +7,7 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::cactus::CactusModel;
-use crate::store::StoredChunk;
+use crate::store::{EmbeddingStore, StoredChunk};
 
 pub struct ParsedQuery {
     pub time_start_ms: Option<u64>,
@@ -81,26 +81,25 @@ impl CactusQueryHandler {
         })
     }
 
-    pub async fn synthesize_answer(&self, query: &str, chunks: &[StoredChunk]) -> Result<String> {
+    pub async fn synthesize_answer(&self, query: &str, chunks: &[StoredChunk], store: &EmbeddingStore) -> Result<String> {
         if chunks.is_empty() {
             return Ok("No camera footage found matching your query.".into());
         }
 
-        // Write representative JPEGs to temp files; Cactus reads them by path.
+        // Load representative JPEGs from disk and write to temp files;
+        // Cactus reads them by path.
         let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
         let mut image_paths: Vec<String> = Vec::new();
-        for (_sc, jpeg) in chunks
-            .iter()
-            .filter_map(|sc| sc.chunk.representative_jpeg.as_ref().map(|j| (sc, j)))
-            .take(10)
-        {
-            let mut tmp = tempfile::Builder::new()
-                .suffix(".jpg")
-                .tempfile()
-                .context("create temp jpeg")?;
-            tmp.write_all(jpeg).context("write temp jpeg")?;
-            image_paths.push(tmp.path().to_string_lossy().into_owned());
-            temp_files.push(tmp);
+        for sc in chunks.iter().take(10) {
+            if let Some(jpeg) = store.get_thumbnail(&sc.chunk.chunk_id) {
+                let mut tmp = tempfile::Builder::new()
+                    .suffix(".jpg")
+                    .tempfile()
+                    .context("create temp jpeg")?;
+                tmp.write_all(&jpeg).context("write temp jpeg")?;
+                image_paths.push(tmp.path().to_string_lossy().into_owned());
+                temp_files.push(tmp);
+            }
         }
 
         let observations: Vec<String> = chunks
@@ -117,12 +116,19 @@ impl CactusQueryHandler {
             .collect();
 
         let content = format!(
-            "You are a security monitoring AI. Look at the frames and answer the question in ONE short sentence.\n\
-            Do NOT think out loud, do NOT explain your reasoning, do NOT use any reasoning channel — just give the final answer directly.\n\n\
-            Observations:\n{}\n\n\
-            Question: {query}\n\
+            "You are a security camera monitoring assistant. A user asked a question about camera footage.\n\n\
+            User question: \"{query}\"\n\n\
+            You are given {n_frames} camera frames from the relevant time periods, plus these metadata observations:\n\
+            {obs}\n\n\
+            Instructions:\n\
+            - Answer the user's SPECIFIC question directly. Do NOT describe the images.\n\
+            - Start with YES or NO if it's a yes/no question.\n\
+            - Cite the camera ID and time when relevant, e.g. [cam-local 2:03 PM].\n\
+            - Keep your answer to 1-3 sentences maximum.\n\
+            - Do NOT think out loud or use any reasoning channel.\n\n\
             Answer:",
-            observations.join("\n")
+            n_frames = image_paths.len(),
+            obs = observations.join("\n"),
         );
 
         let messages = if image_paths.is_empty() {

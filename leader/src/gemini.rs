@@ -86,7 +86,16 @@ impl GeminiEmbedClient {
             .await
             .map_err(|e| anyhow::anyhow!("gemini embed parse failed: {e}"))?;
 
-        Ok(parsed.embedding.values)
+        let mut values = parsed.embedding.values;
+        // L2-normalize so it's consistent with the normalized chunk
+        // embeddings stored by followers.
+        let norm: f32 = values.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in values.iter_mut() {
+                *x /= norm;
+            }
+        }
+        Ok(values)
     }
 }
 

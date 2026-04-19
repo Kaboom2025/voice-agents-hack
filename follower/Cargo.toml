@@ -19,9 +19,9 @@ path = "examples/cactus_smoke.rs"
 required-features = ["cactus"]
 
 [features]
-# Off by default: building without the cactus C dylib should "just work"
-# and fall back to SyntheticEmbedder. Turn on when libcactus.dylib is
-# installed (e.g. via Homebrew on Apple Silicon).
+# Off by default: building without the cactus C dylib still works if
+# GEMINI_API_KEY is set. Turn on when libcactus.dylib is installed
+# (e.g. via Homebrew on Apple Silicon) for on-device embedding.
 default = []
 cactus = []
 
@@ -38,7 +38,6 @@ hound = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 iroh.workspace = true
 nokhwa = { version = "0.10", features = ["input-native"] }
-rand.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true

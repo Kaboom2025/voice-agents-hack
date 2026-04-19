@@ -13,6 +13,7 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+mod chroma;
 mod gemini;
 #[cfg(feature = "cactus")]
 mod query;
@@ -52,7 +53,7 @@ use crate::cactus::CactusModel;
 use crate::gemini::GeminiEmbedClient;
 #[cfg(feature = "cactus")]
 use crate::query::CactusQueryHandler;
-use crate::store::{EmbeddingStore, QueryFilter};
+use crate::store::{EmbeddingStore, QueryFilter, SearchModality};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -95,6 +96,16 @@ struct Args {
     /// Max embedding chunks to retain in memory (older chunks evicted first).
     #[arg(long, env = "STORE_MAX_SIZE", default_value_t = 10_000)]
     store_max_size: usize,
+
+    /// Directory for persistent embedding storage. Chunks and thumbnails
+    /// are written here and reloaded on restart.
+    #[arg(long, env = "STORE_DIR", default_value = ".store")]
+    store_dir: PathBuf,
+
+    /// ChromaDB server URL. Start one with: `uvx --from chromadb chroma run`
+    /// Set to empty string to disable ChromaDB.
+    #[arg(long, env = "CHROMA_URL", default_value = "http://localhost:8000")]
+    chroma_url: String,
 
     /// Gemini API key for embedding user queries. Required for vector
     /// similarity search. Without it, queries fall back to recency-based
@@ -149,7 +160,29 @@ async fn main() -> Result<()> {
     println!("  2. From another computer (Remote):");
     println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
 
-    let store = Arc::new(EmbeddingStore::new(args.store_max_size));
+    // Connect to ChromaDB per-modality collections (PRD §5.2).
+    let chroma = if !args.chroma_url.is_empty() {
+        match chroma::ChromaCollections::connect(&args.chroma_url).await {
+            Ok(c) => {
+                info!(url = %args.chroma_url, "chromadb collections connected");
+                Some(c)
+            }
+            Err(e) => {
+                warn!(url = %args.chroma_url, error = %e,
+                    "chromadb connection failed — using brute-force search. \
+                     Start chroma with: uvx --from chromadb chroma run");
+                None
+            }
+        }
+    } else {
+        info!("chromadb disabled (empty --chroma-url)");
+        None
+    };
+
+    let store = Arc::new(
+        EmbeddingStore::open(&args.store_dir, args.store_max_size, chroma)
+            .with_context(|| format!("open store at {}", args.store_dir.display()))?,
+    );
 
     // Build the Gemini embedding client for query-time text embedding.
     let gemini_embed = args.gemini_api_key.as_ref().map(|key| {
@@ -157,7 +190,7 @@ async fn main() -> Result<()> {
         Arc::new(GeminiEmbedClient::new(key.clone()))
     });
     if gemini_embed.is_none() {
-        warn!("no GEMINI_API_KEY — queries will use recency ranking, not vector similarity");
+        warn!("no GEMINI_API_KEY — queries will fail unless built with --features cactus");
     }
 
     // Load Gemma up front. If it fails, log and keep serving — the rest
@@ -461,6 +494,7 @@ async fn serve_stream(
                             e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
                         }
                         state.store.push(chunk.clone());
+                        state.store.sync_to_chroma(&chunk).await;
                         info!(
                             total = n,
                             camera = %chunk.camera_id,
@@ -651,24 +685,21 @@ async fn live_jpg(State(state): State<AppState>, AxPath(camera_id): AxPath<Strin
 
 // ──────────────────────────── thumbnail ──────────────────────────────
 
-/// Serves the representative JPEG thumbnail stored with each chunk.
+/// Serves the representative JPEG thumbnail stored on disk.
 async fn thumbnail(
     State(state): State<AppState>,
     AxPath(chunk_id): AxPath<String>,
 ) -> Response {
-    match state.store.get_by_id(&chunk_id) {
-        Some(sc) => match sc.chunk.representative_jpeg {
-            Some(jpeg) => (
-                [
-                    (header::CONTENT_TYPE, "image/jpeg"),
-                    (header::CACHE_CONTROL, "public, max-age=3600, immutable"),
-                ],
-                jpeg,
-            )
-                .into_response(),
-            None => (StatusCode::NOT_FOUND, "chunk has no thumbnail").into_response(),
-        },
-        None => (StatusCode::NOT_FOUND, "chunk not found").into_response(),
+    match state.store.get_thumbnail(&chunk_id) {
+        Some(jpeg) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=3600, immutable"),
+            ],
+            jpeg,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no thumbnail for this chunk").into_response(),
     }
 }
 
@@ -683,6 +714,8 @@ struct QueryReq {
     time_range: Option<TimeRange>,
     #[serde(default)]
     top_k: Option<u32>,
+    #[serde(default)]
+    modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -718,40 +751,45 @@ struct HitJson {
 }
 
 /// Shared retrieval logic: embed the query text via local Cactus/Gemma
-/// (preferred) or Gemini API (fallback), then search the store by
-/// cosine similarity.
+/// (preferred) or Gemini API, then search the store by cosine similarity.
 async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredChunk>> {
-    let now = now_ms();
+    // Embed the query text for vector search.
+    // Priority: 1) local Cactus/Gemma  2) Gemini API
+    let query_embedding = embed_query(state, &req.query).await?;
 
-    // Try to embed the query text for vector search.
-    // Priority: 1) local Cactus/Gemma  2) Gemini API  3) recency fallback
-    let query_embedding = embed_query(state, &req.query).await;
-
-    // When we have a query embedding, search ALL stored data (no time
-    // window) unless the user explicitly constrains it. Without an
-    // embedding we fall back to recency, so default to last 30 minutes
-    // to avoid dumping 10k chunks.
-    let (default_start, default_end) = if query_embedding.is_some() {
-        (None, None) // semantic search — scan everything
-    } else {
-        (Some(now.saturating_sub(30 * 60 * 1000)), Some(now))
+    // Determine search modality from the request.
+    let modality = match &req.modalities {
+        Some(mods) => {
+            let has_video = mods.iter().any(|m| m == "video");
+            let has_audio = mods.iter().any(|m| m == "audio");
+            match (has_video, has_audio) {
+                (true, false) => SearchModality::Video,
+                (false, true) => SearchModality::Audio,
+                _ => SearchModality::Video, // default: text queries match video
+            }
+        }
+        // Text queries are most semantically related to visual content,
+        // so default to video-only matching.
+        None => SearchModality::Video,
     };
 
     let filter = QueryFilter {
-        query_embedding,
-        time_start_ms: req.time_range.as_ref().map(|tr| tr.from_ms).or(default_start),
-        time_end_ms: req.time_range.as_ref().map(|tr| tr.to_ms).or(default_end),
+        query_embedding: Some(query_embedding),
+        time_start_ms: req.time_range.as_ref().map(|tr| tr.from_ms),
+        time_end_ms: req.time_range.as_ref().map(|tr| tr.to_ms),
         camera_ids: req.cameras.clone(),
         top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
+        modality,
+        caption_query: Some(req.query.clone()),
     };
 
-    Ok(state.store.query(&filter))
+    Ok(state.store.query_async(&filter).await)
 }
 
 /// Embed query text for vector search. Uses local Cactus model when
 /// available (no network round-trip), Gemini API as fallback.
 #[cfg(feature = "cactus")]
-async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
     // 1) Try local Cactus/Gemma text embedding (fast, no API key needed).
     if let Some(ref model) = state.llm {
         let model = Arc::clone(model);
@@ -759,23 +797,23 @@ async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
         match tokio::task::spawn_blocking(move || model.embed_text(&text, true)).await {
             Ok(Ok(vec)) => {
                 info!(dim = vec.len(), "query embedded via local cactus/gemma");
-                return Some(vec);
+                return Ok(vec);
             }
             Ok(Err(e)) => {
-                warn!(%e, "cactus text embed failed, trying gemini fallback");
+                warn!(%e, "cactus text embed failed, trying gemini");
             }
             Err(e) => {
-                warn!(%e, "cactus embed task panicked, trying gemini fallback");
+                warn!(%e, "cactus embed task panicked, trying gemini");
             }
         }
     }
 
-    // 2) Gemini API fallback.
+    // 2) Gemini API.
     if let Some(ref client) = state.gemini_embed {
         match client.embed_text(query).await {
             Ok(vec) => {
                 info!(dim = vec.len(), "query embedded via gemini API");
-                return Some(vec);
+                return Ok(vec);
             }
             Err(e) => {
                 warn!(%e, "gemini query embedding also failed");
@@ -783,25 +821,27 @@ async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
         }
     }
 
-    warn!("no embedding available — falling back to recency ranking");
-    None
+    anyhow::bail!(
+        "no embedding backend available for query. Set GEMINI_API_KEY or build with --features cactus."
+    )
 }
 
 #[cfg(not(feature = "cactus"))]
-async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
     if let Some(ref client) = state.gemini_embed {
         match client.embed_text(query).await {
             Ok(vec) => {
                 info!(dim = vec.len(), "query embedded via gemini API");
-                return Some(vec);
+                return Ok(vec);
             }
             Err(e) => {
-                warn!(%e, "query text embedding failed, falling back to recency");
+                anyhow::bail!("query text embedding failed: {e}. Check your GEMINI_API_KEY.");
             }
         }
     }
-    warn!("no embedding available — falling back to recency ranking");
-    None
+    anyhow::bail!(
+        "no embedding backend available for query. Set GEMINI_API_KEY or build with --features cactus."
+    )
 }
 
 fn scored_to_hits(scored: &[store::ScoredChunk]) -> (Vec<HitJson>, Vec<CitationJson>) {
@@ -816,10 +856,11 @@ fn scored_to_hits(scored: &[store::ScoredChunk]) -> (Vec<HitJson>, Vec<CitationJ
                 end_ts_ms: c.end_ts_ms,
                 caption: c.caption.clone(),
                 score: sc.score,
-                thumbnail_url: c
-                    .representative_jpeg
-                    .as_ref()
-                    .map(|_| format!("/api/thumbnail/{}", c.chunk_id)),
+                thumbnail_url: if sc.chunk.has_thumbnail {
+                    Some(format!("/api/thumbnail/{}", c.chunk_id))
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -864,7 +905,7 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
     let stored: Vec<store::StoredChunk> = scored.iter().map(|sc| sc.chunk.clone()).collect();
     let answer = if let Some(model) = state.llm.clone() {
         let handler = CactusQueryHandler::new(model);
-        match handler.synthesize_answer(&req.query, &stored).await {
+        match handler.synthesize_answer(&req.query, &stored, &state.store).await {
             Ok(a) => a,
             Err(e) => {
                 warn!(%e, "LLM synthesis failed, returning retrieval-only results");
@@ -908,7 +949,7 @@ async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Resp
 
 #[cfg(test)]
 mod tests {
-    use crate::store::{EmbeddingStore, QueryFilter};
+    use crate::store::{EmbeddingStore, QueryFilter, SearchModality};
     use common::EmbeddingChunk;
     use std::sync::Arc;
 
@@ -919,7 +960,7 @@ mod tests {
             start_ts_ms: ts_ms,
             end_ts_ms: ts_ms + 5000,
             embedding: vec![0.1, 0.2],
-            video_dim: 0,
+            video_dim: 2,
             audio_dim: 0,
             caption: None,
             representative_jpeg: None,
@@ -937,6 +978,8 @@ mod tests {
             time_end_ms: None,
             camera_ids: None,
             top_k: 10,
+            modality: SearchModality::default(),
+            caption_query: None,
         });
         assert_eq!(results.len(), 2);
     }

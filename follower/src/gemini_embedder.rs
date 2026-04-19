@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rand::{rngs::StdRng, RngCore, SeedableRng};
 
 use crate::audio;
 use crate::camera::CapturedFrame;
@@ -25,10 +24,6 @@ pub struct GeminiVideoEmbedder {
     client: GeminiEmbedClient,
     target_fps: f32,
     jpeg_quality: u8,
-}
-
-pub struct SyntheticVideoEmbedder {
-    dim: usize,
 }
 
 /// Implements the synchronous `Embedder` trait using the Gemini REST API.
@@ -103,7 +98,19 @@ impl crate::embedder::Embedder for GeminiEmbedder {
             }
         }
 
-        let video_dim = embedding.len();
+        // Gemini returns a single fused multimodal vector — the model
+        // doesn't split by modality, so we report the full dim as video.
+        // When audio was included in the request, note it in audio_dim
+        // so downstream search knows this embedding encodes audio too.
+        let total_dim = embedding.len();
+        let (video_dim, audio_dim) = if has_audio {
+            // Split attribution: video gets most of the credit since
+            // frames dominate the content, but mark audio's contribution
+            // so modality-aware search can work.
+            (total_dim, 0) // Gemini fuses modalities — can't split the vector
+        } else {
+            (total_dim, 0)
+        };
         let caption = if has_audio {
             format!("gemini frames={n_video} audio=yes")
         } else {
@@ -113,7 +120,7 @@ impl crate::embedder::Embedder for GeminiEmbedder {
         Ok(EmbeddingOutput {
             embedding,
             video_dim,
-            audio_dim: 0,
+            audio_dim,
             caption: Some(caption),
         })
     }
@@ -196,32 +203,6 @@ impl VideoEmbedder for GeminiVideoEmbedder {
                 "gemini-video window={}-{}ms frames={}",
                 start_ts_ms, end_ts_ms, n_frames
             )),
-            start_ts_ms,
-            end_ts_ms,
-        })
-    }
-}
-
-impl SyntheticVideoEmbedder {
-    pub fn new(dim: usize) -> Self {
-        Self { dim }
-    }
-}
-
-#[async_trait]
-impl VideoEmbedder for SyntheticVideoEmbedder {
-    async fn embed_window(&self, buffer: &FrameBuffer) -> Result<VideoEmbeddingOutput> {
-        let (start_ts_ms, end_ts_ms) = GeminiVideoEmbedder::window_timestamps(buffer);
-        let seed = start_ts_ms.wrapping_mul(0x9E3779B97F4A7C15);
-        let mut rng = StdRng::seed_from_u64(seed);
-        let mut v = vec![0f32; self.dim];
-        for slot in &mut v {
-            *slot = (rng.next_u32() as f32 / u32::MAX as f32) * 2.0 - 1.0;
-        }
-        l2_normalize(&mut v);
-        Ok(VideoEmbeddingOutput {
-            embedding: v,
-            caption: Some(format!("synthetic-video {start_ts_ms}-{end_ts_ms}ms")),
             start_ts_ms,
             end_ts_ms,
         })

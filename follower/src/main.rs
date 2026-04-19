@@ -1,13 +1,12 @@
-//! Follower CLI: webcam + mic → Gemini/Cactus/Synthetic embedding → iroh QUIC push.
+//! Follower CLI: webcam + mic → Gemini/Cactus embedding → iroh QUIC push.
 //!
 //! PRD §5.1: each 5 s chunk samples K=4 evenly-spaced frames from the
 //! camera plus the audio segment from the microphone. The embedder
 //! produces a `[video_emb || audio_emb]` vector per chunk.
 //!
-//! Embeds video windows (sliding frames) using GeminiVideoEmbedder, with synthetic
-//! fallback when the API key is unavailable or `--synthetic` is passed.
-//! That keeps the transport testable in CI / headless / no-GPU environments
-//! without changing the wire protocol.
+//! Embeds video windows (sliding frames) using GeminiVideoEmbedder.
+//! Requires either a Cactus/Gemma model or a Gemini API key — will
+//! not start without a real embedding backend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +23,7 @@ use follower::cactus::CactusModel;
 use follower::camera::{self, CapturedFrame};
 #[cfg(feature = "cactus")]
 use follower::embedder::CactusEmbedder;
-use follower::embedder::{ChunkInput, Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
+use follower::embedder::{ChunkInput, Embedder};
 use follower::gemini_embedder::{GeminiEmbedder, GeminiVideoEmbedder};
 use iroh::Endpoint;
 use tokio::sync::{mpsc, watch};
@@ -52,13 +51,19 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     window_ms: u64,
 
-    /// Gemini API key. If set, uses GeminiVideoEmbedder. Falls back to synthetic.
+    /// Gemini API key. If set, uses GeminiVideoEmbedder. Required when
+    /// Cactus model is not available.
     #[arg(long, env = "GEMINI_API_KEY")]
     gemini_api_key: Option<String>,
 
-    /// Force synthetic random vectors regardless of API key availability.
-    #[arg(long, default_value_t = false)]
-    synthetic: bool,
+    /// Path to the Cactus-converted Gemma weights directory. Used when
+    /// built with `--features cactus` for on-device embedding.
+    #[arg(
+        long,
+        env = "GEMMA_MODEL_PATH",
+        default_value = "weights/gemma-4-e2b-it"
+    )]
+    model_path: PathBuf,
 
     /// Stop after this many chunks. 0 = run forever.
     #[arg(long, default_value_t = 0)]
@@ -134,8 +139,8 @@ async fn main() -> Result<()> {
 
     // --- Build the frame source (once, reused across reconnects) -
     let frames = if args.no_camera {
-        info!("frame source: solid placeholder");
-        FrameSource::Still(solid_placeholder())
+        info!("frame source: disabled (--no-camera)");
+        FrameSource::None
     } else {
         match camera::spawn(args.device_index) {
             Ok(handle) => {
@@ -143,8 +148,7 @@ async fn main() -> Result<()> {
                 FrameSource::Cam(handle.rx)
             }
             Err(e) => {
-                warn!(error = %e, "camera open failed, using placeholder frame");
-                FrameSource::Still(solid_placeholder())
+                bail!("camera open failed: {e}. Use --no-camera to run without a webcam.");
             }
         }
     };
@@ -485,16 +489,37 @@ fn now_ms() -> u64 {
 }
 
 async fn build_embedder(args: &Args) -> Result<Arc<dyn Embedder>> {
-    if args.synthetic {
-        info!("embedder: synthetic (flag)");
-        return Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)));
+    // 1) Try local Cactus/Gemma (on-device, no API key needed).
+    #[cfg(feature = "cactus")]
+    {
+        if args.model_path.exists() {
+            info!(path = %args.model_path.display(), "loading gemma-4 via cactus for embedding");
+            match CactusModel::new(&args.model_path) {
+                Ok(model) => {
+                    info!("embedder: CactusEmbedder (local gemma-4)");
+                    return Ok(Arc::new(CactusEmbedder::new(Arc::new(model))));
+                }
+                Err(e) => {
+                    warn!(error = %e, "cactus model load failed, trying gemini");
+                }
+            }
+        } else {
+            info!(path = %args.model_path.display(), "gemma weights not found, trying gemini");
+        }
     }
+
+    // 2) Gemini API.
     if let Some(ref key) = args.gemini_api_key {
         info!("embedder: GeminiEmbedder (gemini-embedding-2-preview)");
         return Ok(Arc::new(GeminiEmbedder::new(key.clone())));
     }
-    info!("embedder: synthetic (no API key)");
-    Ok(Arc::new(SyntheticEmbedder::new(GEMMA4_HIDDEN_DIM)))
+
+    // No embedding backend available — refuse to start.
+    bail!(
+        "no embedding backend available. Either:\n  \
+         1) Build with --features cactus and provide model weights at --model-path, or\n  \
+         2) Set GEMINI_API_KEY (or --gemini-api-key) for the Gemini API."
+    )
 }
 
 /// Encode an in-memory RGB frame to JPEG. Returns `(bytes, width, height)`.
@@ -520,23 +545,14 @@ fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<(Vec<u8>, u32, u32)
 #[derive(Clone)]
 enum FrameSource {
     Cam(tokio::sync::watch::Receiver<Option<CapturedFrame>>),
-    Still(CapturedFrame),
+    None,
 }
 
 impl FrameSource {
     fn current(&self) -> Option<CapturedFrame> {
         match self {
             FrameSource::Cam(rx) => rx.borrow().clone(),
-            FrameSource::Still(f) => Some(f.clone()),
+            FrameSource::None => None,
         }
-    }
-}
-
-/// 64x64 mid-gray RGB frame used when no camera is available.
-fn solid_placeholder() -> CapturedFrame {
-    CapturedFrame {
-        width: 64,
-        height: 64,
-        rgb: Arc::new(vec![128u8; 64 * 64 * 3]),
     }
 }

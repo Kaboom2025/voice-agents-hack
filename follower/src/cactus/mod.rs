@@ -18,12 +18,13 @@ pub mod ffi;
 
 /// Max embedding dimensionality Cactus can return. The Python bindings
 /// hardcode 4096 floats; empirically on Gemma-4-E2B `cactus_image_embed`
-/// returns the full pre-pooled vision tensor (~393k f32s). We size to
-/// 512k floats (2 MB) so a single image embed fits with headroom.
+/// returns the full pre-pooled vision tensor (~393k f32s) and
+/// `cactus_audio_embed` returns ~720k f32s (~2.75 MB). We size to
+/// 1M floats (4 MB) so both image and audio embeds fit with headroom.
 ///
 /// Cactus reports the required buffer in **bytes**; we pass
 /// `EMBED_BUF_LEN * size_of::<f32>()` as the `buf_size` argument below.
-const EMBED_BUF_LEN: usize = 512 * 1024;
+const EMBED_BUF_LEN: usize = 1024 * 1024;
 
 const EMBED_BUF_BYTES: usize = EMBED_BUF_LEN * std::mem::size_of::<f32>();
 
