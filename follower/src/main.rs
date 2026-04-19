@@ -220,16 +220,14 @@ async fn main() -> Result<()> {
                 FrameSource::Still(f) => {
                     buf.push(now_ms(), f);
                 }
-                FrameSource::Cam(mut rx) => {
-                    loop {
-                        if rx.changed().await.is_err() {
-                            break;
-                        }
-                        if let Some(frame) = rx.borrow().clone() {
-                            buf.push(now_ms(), frame);
-                        }
+                FrameSource::Cam(mut rx) => loop {
+                    if rx.changed().await.is_err() {
+                        break;
                     }
-                }
+                    if let Some(frame) = rx.borrow().clone() {
+                        buf.push(now_ms(), frame);
+                    }
+                },
             }
         });
     }
