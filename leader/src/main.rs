@@ -1,16 +1,19 @@
 //! Leader: accepts ingest connections from any number of followers, prints
 //! a ticket on startup, and logs every chunk it receives.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use common::{FollowerMsg, INGEST_ALPN, LeaderMsg, Ticket, read_frame, write_frame};
 use iroh::{
-    Endpoint, Watcher,
+    Endpoint, SecretKey, Watcher,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -19,6 +22,13 @@ use tracing::{error, info, warn};
 #[derive(Parser, Debug)]
 #[command(about = "iroh leader: accepts data from followers")]
 struct Args {
+    /// Path to a file holding the leader's 32-byte secret key as hex.
+    /// Created with mode 0600 on first run if missing. Pin this file to keep
+    /// your node id (and therefore the identity inside the ticket) stable
+    /// across restarts.
+    #[arg(long, env = "LEADER_KEY_FILE", default_value = ".leader.key")]
+    key_file: PathBuf,
+
     /// Filter logs (default `info`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
@@ -26,19 +36,25 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Pull values from `.env` if present; real env always wins.
+    let _ = dotenvy::dotenv();
+
     let args = Args::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(args.log)
+        .with_env_filter(&args.log)
         .with_target(false)
         .init();
 
+    let secret_key = load_or_create_key(&args.key_file)?;
+
     let endpoint = Endpoint::builder()
+        .secret_key(secret_key)
         .discovery_n0()
         .bind()
         .await?;
 
     let id = endpoint.node_id();
-    info!(node_id = %id, "leader endpoint bound");
+    info!(node_id = %id, key_file = %args.key_file.display(), "leader endpoint bound");
 
     // Wait until our address (relay/direct) is known so the ticket is dialable.
     let addr = endpoint.node_addr().initialized().await;
@@ -57,6 +73,42 @@ async fn main() -> Result<()> {
     info!("shutting down");
     router.shutdown().await?;
     Ok(())
+}
+
+/// Load a hex-encoded 32-byte secret key from `path`, or generate a fresh one
+/// and persist it there (mode 0600 on unix).
+fn load_or_create_key(path: &Path) -> Result<SecretKey> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read key file {}", path.display()))?;
+        let bytes = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(text.trim().as_bytes())
+            .with_context(|| format!("key file {} is not valid hex", path.display()))?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .with_context(|| format!("key file {} must decode to 32 bytes", path.display()))?;
+        info!(path = %path.display(), "loaded secret key");
+        Ok(SecretKey::from_bytes(&arr))
+    } else {
+        let sk = SecretKey::generate(&mut rand_core_06::OsRng);
+        let encoded = data_encoding::HEXLOWER.encode(&sk.to_bytes());
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        std::fs::write(path, encoded)
+            .with_context(|| format!("write key file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 600 {}", path.display()))?;
+        }
+        info!(path = %path.display(), "generated new secret key");
+        Ok(sk)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
