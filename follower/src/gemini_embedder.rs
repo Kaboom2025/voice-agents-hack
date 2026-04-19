@@ -3,10 +3,11 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 
+use crate::audio;
 use crate::camera::CapturedFrame;
 use crate::embedder::{ChunkInput, EmbeddingOutput};
 use crate::frame_buffer::FrameBuffer;
-use crate::gemini_client::GeminiEmbedClient;
+use crate::gemini_client::{GeminiEmbedClient, MediaPart};
 
 pub struct VideoEmbeddingOutput {
     pub embedding: Vec<f32>,
@@ -54,22 +55,46 @@ impl crate::embedder::Embedder for GeminiEmbedder {
 
     async fn embed_chunk(&self, input: &ChunkInput, _seq: u64) -> Result<EmbeddingOutput> {
         // JPEG encode is CPU-bound — offload to a blocking thread so we
-        // don't hold up the async runtime while encoding 4 HD frames.
+        // don't hold up the async runtime while encoding 4 HD frames + audio WAV.
         let frames = input.frames.clone();
+        let audio_samples = input.audio_samples.clone();
         let quality = self.jpeg_quality;
-        let b64_frames: Vec<String> = tokio::task::spawn_blocking(move || {
-            frames
-                .iter()
-                .map(|f| GeminiVideoEmbedder::encode_jpeg_b64(f, quality))
-                .collect::<Result<Vec<_>>>()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("jpeg encode task join: {e}"))??;
+        let media_parts: Vec<MediaPart> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<MediaPart>> {
+                let mut parts: Vec<MediaPart> = frames
+                    .iter()
+                    .map(|f| {
+                        let b64 = GeminiVideoEmbedder::encode_jpeg_b64(f, quality)?;
+                        Ok(MediaPart {
+                            mime_type: "image/jpeg".to_string(),
+                            data_b64: b64,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
-        anyhow::ensure!(!b64_frames.is_empty(), "no frames to embed");
+                // Add audio as WAV if samples present
+                if !audio_samples.is_empty() {
+                    let wav_bytes = audio::encode_wav_bytes(&audio_samples);
+                    let wav_b64 = B64.encode(&wav_bytes);
+                    parts.push(MediaPart {
+                        mime_type: "audio/wav".to_string(),
+                        data_b64: wav_b64,
+                    });
+                }
 
-        let n = b64_frames.len();
-        let mut embedding = self.client.embed(b64_frames).await?;
+                Ok(parts)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("media encode task join: {e}"))??;
+
+        anyhow::ensure!(!media_parts.is_empty(), "no media to embed");
+
+        let n_video = media_parts
+            .iter()
+            .filter(|p| p.mime_type == "image/jpeg")
+            .count();
+        let has_audio = media_parts.iter().any(|p| p.mime_type == "audio/wav");
+        let mut embedding = self.client.embed(media_parts).await?;
 
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
@@ -79,11 +104,17 @@ impl crate::embedder::Embedder for GeminiEmbedder {
         }
 
         let video_dim = embedding.len();
+        let caption = if has_audio {
+            format!("gemini frames={n_video} audio=yes")
+        } else {
+            format!("gemini frames={n_video}")
+        };
+
         Ok(EmbeddingOutput {
             embedding,
             video_dim,
             audio_dim: 0,
-            caption: Some(format!("gemini frames={n}")),
+            caption: Some(caption),
         })
     }
 }
@@ -144,13 +175,19 @@ impl VideoEmbedder for GeminiVideoEmbedder {
         anyhow::ensure!(!sampled.is_empty(), "frame buffer is empty — cannot embed");
 
         let quality = self.jpeg_quality;
-        let b64_frames: Vec<String> = sampled
+        let media_parts: Vec<MediaPart> = sampled
             .iter()
-            .map(|f| Self::encode_jpeg_b64(f, quality))
+            .map(|f| {
+                let b64 = Self::encode_jpeg_b64(f, quality)?;
+                Ok(MediaPart {
+                    mime_type: "image/jpeg".to_string(),
+                    data_b64: b64,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
 
-        let n_frames = b64_frames.len();
-        let mut values = self.client.embed(b64_frames).await?;
+        let n_frames = media_parts.len();
+        let mut values = self.client.embed(media_parts).await?;
         l2_normalize(&mut values);
 
         Ok(VideoEmbeddingOutput {
