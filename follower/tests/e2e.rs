@@ -1,11 +1,9 @@
-//! Hermetic end-to-end over real iroh QUIC, driven with the synthetic
-//! embedder so we don't need Cactus or a webcam in CI.
+//! Hermetic end-to-end over real iroh QUIC — verifies the transport
+//! layer without requiring Cactus or a webcam.
 
 use std::time::Duration;
 
 use common::{read_frame, write_frame, FollowerMsg, LeaderMsg, INGEST_ALPN};
-use follower::camera::CapturedFrame;
-use follower::embedder::{Embedder, SyntheticEmbedder};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -44,8 +42,7 @@ impl ProtocolHandler for TapHandler {
                                     write_frame(&mut send, &LeaderMsg::Ack { chunk_id: id }).await;
                             }
                             FollowerMsg::Bye => return,
-                            FollowerMsg::FrameResponse { .. } => {}
-                            FollowerMsg::FrameError { .. } => {}
+                            FollowerMsg::FrameResponse { .. } | FollowerMsg::FrameError { .. } => {}
                         }
                     }
                 });
@@ -56,7 +53,7 @@ impl ProtocolHandler for TapHandler {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn synthetic_follower_delivers_chunks_to_ingest_router() {
+async fn transport_delivers_chunks_to_ingest_router() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     // Leader
@@ -71,7 +68,7 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
         .spawn();
     let leader_addr = leader_ep.node_addr().initialized().await;
 
-    // Follower — connect + ship N synthetic chunks
+    // Follower — connect + ship N chunks with simple test embeddings
     let follower_ep = Endpoint::builder().discovery_n0().bind().await.unwrap();
     let conn = follower_ep.connect(leader_addr, INGEST_ALPN).await.unwrap();
     let (mut send, _recv) = conn.open_bi().await.unwrap();
@@ -84,22 +81,22 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
     .await
     .unwrap();
 
-    let embedder = SyntheticEmbedder::new(1536);
-    let dummy = CapturedFrame {
-        width: 8,
-        height: 8,
-        rgb: Arc::new(vec![0u8; 8 * 8 * 3]),
-    };
     const WANT: u64 = 3;
+    const DIM: usize = 1536;
     for seq in 0..WANT {
-        let out = embedder.embed_frame(&dummy, seq).unwrap();
+        // Create a simple deterministic embedding for testing transport.
+        let mut embedding = vec![0f32; DIM];
+        embedding[seq as usize % DIM] = 1.0; // one-hot for uniqueness
         let chunk = common::EmbeddingChunk {
             chunk_id: format!("cam-test-{seq}"),
             camera_id: "cam-test".into(),
             start_ts_ms: 0,
             end_ts_ms: 0,
-            embedding: out.embedding,
-            caption: out.caption,
+            embedding,
+            video_dim: DIM,
+            audio_dim: 0,
+            caption: Some(format!("test chunk #{seq}")),
+            representative_jpeg: None,
         };
         write_frame(&mut send, &FollowerMsg::Chunk(chunk))
             .await
@@ -118,7 +115,7 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
     assert_eq!(handler.count.load(Ordering::Relaxed), WANT);
     for (i, c) in got.iter().enumerate() {
         assert_eq!(c.chunk_id, format!("cam-test-{i}"));
-        assert_eq!(c.embedding.len(), 1536);
+        assert_eq!(c.embedding.len(), DIM);
     }
 
     follower_ep.close().await;

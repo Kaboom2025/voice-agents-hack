@@ -16,6 +16,12 @@ pub mod ffi;
 /// tokens by default, ~32 KiB text worst case).
 const RESPONSE_BUF_BYTES: usize = 64 * 1024;
 
+/// Max embedding dimensionality. Sized to handle the full pre-pooled
+/// vision tensor (~393k f32s). We pass `EMBED_BUF_LEN * size_of::<f32>()`
+/// as the `buf_size` argument.
+const EMBED_BUF_LEN: usize = 512 * 1024;
+const EMBED_BUF_BYTES: usize = EMBED_BUF_LEN * std::mem::size_of::<f32>();
+
 pub struct CactusModel {
     inner: Mutex<ModelHandle>,
 }
@@ -50,8 +56,7 @@ impl CactusModel {
 
         // SAFETY: both pointers are valid for the duration of the call;
         // Cactus copies the strings internally.
-        let handle =
-            unsafe { ffi::cactus_init(model_cstr.as_ptr(), ptr::null(), false) };
+        let handle = unsafe { ffi::cactus_init(model_cstr.as_ptr(), ptr::null(), false) };
 
         if handle.is_null() {
             return Err(anyhow!(
@@ -64,6 +69,37 @@ impl CactusModel {
         })
     }
 
+    /// Embed `text` into a float vector using Gemma 4's text embedding.
+    /// The vector is L2-normalized when `normalize` is true.
+    pub fn embed_text(&self, text: &str, normalize: bool) -> Result<Vec<f32>> {
+        let text_cstr = CString::new(text)?;
+        let mut buf = vec![0f32; EMBED_BUF_LEN];
+        let mut dim: usize = 0;
+
+        let rc = {
+            let guard = self.inner.lock().unwrap();
+            // SAFETY: mutex-held, handle non-null, buf/dim valid.
+            unsafe {
+                ffi::cactus_embed(
+                    guard.0,
+                    text_cstr.as_ptr(),
+                    buf.as_mut_ptr(),
+                    EMBED_BUF_BYTES,
+                    &mut dim,
+                    normalize,
+                )
+            }
+        };
+        if rc < 0 {
+            return Err(anyhow!(
+                "cactus_embed rc={rc}: {}",
+                last_error().unwrap_or_else(|| "<no error message>".into())
+            ));
+        }
+        buf.truncate(dim);
+        Ok(buf)
+    }
+
     /// Run a chat completion. `messages_json` is a JSON array of
     /// `{"role": ..., "content": ...}`. Returns the raw JSON response
     /// string Cactus emits (containing `response`, timing stats, etc).
@@ -73,9 +109,7 @@ impl CactusModel {
             .map(CString::new)
             .transpose()
             .context("options contain NUL byte")?;
-        let opts_ptr = opts_c
-            .as_ref()
-            .map_or(ptr::null(), |c| c.as_ptr());
+        let opts_ptr = opts_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
 
         let mut buf = vec![0 as c_char; RESPONSE_BUF_BYTES];
 

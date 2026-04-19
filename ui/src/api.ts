@@ -1,8 +1,5 @@
 // Typed contract for the leader's HTTP/WS surface.
 // Mirrors PRD §5.4 (POST /query) plus the Watch and Command modes.
-// The mock client returns fixtures so the UI is buildable before the
-// axum server inside `leader` exists. Swap `mockClient` for a real
-// `httpClient` later — nothing else has to change.
 
 export type CameraStatus = "online" | "offline" | "degraded";
 
@@ -47,6 +44,22 @@ export type QueryResponse = {
   hits: ClipHit[];
 };
 
+export type SearchResponse = {
+  hits: ClipHit[];
+  took_ms: number;
+};
+
+export type AnswerRequest = {
+  query: string;
+  chunk_ids: string[];
+};
+
+export type AnswerResponse = {
+  answer: string;
+  citations: Citation[];
+  took_ms: number;
+};
+
 export type RpcMethod = "GetConfig" | "SetConfig" | "Ping" | "RotateKeys";
 
 export type RpcRequest = {
@@ -69,87 +82,28 @@ export type LiveFrame = {
   poster_url: string;
 };
 
+export type PlaybackInfo = {
+  camera_id: string;
+  playlist_url: string;
+  start_ts_ms?: number;
+  available: boolean;
+};
+
 export interface ApiClient {
   listCameras(): Promise<Camera[]>;
   query(req: QueryRequest): Promise<QueryResponse>;
+  search(req: QueryRequest): Promise<SearchResponse>;
+  answer(req: AnswerRequest): Promise<AnswerResponse>;
   rpcStream(req: RpcRequest): AsyncIterable<RpcEvent>;
   liveStream(cameraIds: string[], signal: AbortSignal): AsyncIterable<LiveFrame>;
   clipUrl(chunkId: string): string;
+  playback(cameraId: string, startTsMs?: number): Promise<PlaybackInfo>;
 }
 
-// ────────────────────────── mock implementation ──────────────────────────
-
-const FIXTURE_CAMERAS: Camera[] = [
-  { id: "cam-front-door", follower_node_id: "node-1", status: "online", last_seen_ms: Date.now(), chunks_per_min: 12 },
-  { id: "cam-lab-1", follower_node_id: "node-2", status: "online", last_seen_ms: Date.now(), chunks_per_min: 12 },
-  { id: "cam-lab-2", follower_node_id: "node-3", status: "degraded", last_seen_ms: Date.now() - 30_000, chunks_per_min: 4 },
-  { id: "cam-loading-bay", follower_node_id: "node-4", status: "offline", last_seen_ms: Date.now() - 600_000, chunks_per_min: 0 },
-];
+// ────────────────────────── HTTP client ──────────────────────────
+// Talks to the leader's axum server (proxied through Vite at /api).
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-export const mockClient: ApiClient = {
-  async listCameras() {
-    await sleep(120);
-    return FIXTURE_CAMERAS;
-  },
-
-  async query(req) {
-    await sleep(400);
-    const cams = req.cameras ?? FIXTURE_CAMERAS.map((c) => c.id);
-    const now = Date.now();
-    const hits: ClipHit[] = cams.slice(0, 3).map((cam, i) => ({
-      chunk_id: `${cam}-${1000 + i}`,
-      camera_id: cam,
-      start_ts_ms: now - (i + 1) * 60_000,
-      end_ts_ms: now - (i + 1) * 60_000 + 5_000,
-      caption: `Synthetic match #${i + 1} on ${cam}`,
-      score: 0.9 - i * 0.07,
-    }));
-    return {
-      answer: `Mock synthesis for "${req.query}". Replace mockClient with the real HTTP client to get LLM-generated answers grounded in the multicam index.`,
-      citations: hits.map((h) => ({
-        camera_id: h.camera_id,
-        chunk_id: h.chunk_id,
-        start_ts_ms: h.start_ts_ms,
-        end_ts_ms: h.end_ts_ms,
-      })),
-      hits,
-    };
-  },
-
-  async *rpcStream(req) {
-    for (const camera_id of req.cameras) {
-      await sleep(150);
-      yield { camera_id, chunk: `[${req.method}] ack from ${camera_id}\n`, done: false };
-      await sleep(150);
-      yield { camera_id, chunk: `ok\n`, done: true };
-    }
-  },
-
-  async *liveStream(cameraIds, signal) {
-    while (!signal.aborted) {
-      for (const camera_id of cameraIds) {
-        if (signal.aborted) return;
-        yield {
-          camera_id,
-          ts_ms: Date.now(),
-          poster_url: "",
-        };
-      }
-      await sleep(1000);
-    }
-  },
-
-  clipUrl(chunkId) {
-    return `/api/clips/${encodeURIComponent(chunkId)}`;
-  },
-};
-
-// ────────────────────────── real HTTP client ──────────────────────────
-// Talks to the leader's axum server (proxied through Vite at /api).
-// `liveStream` and `listCameras` are real; query/rpcStream/clipUrl still
-// fall through to the mock until those leader endpoints exist.
 
 export function liveJpegUrl(cameraId: string, cacheBust?: number): string {
   const t = cacheBust ?? performance.now();
@@ -172,7 +126,39 @@ export const httpClient: ApiClient = {
     if (!res.ok) throw new Error(`query: ${res.status} ${await res.text()}`);
     return (await res.json()) as QueryResponse;
   },
-  rpcStream: mockClient.rpcStream,
+
+  async search(req) {
+    const res = await fetch("/api/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`search: ${res.status} ${await res.text()}`);
+    return (await res.json()) as SearchResponse;
+  },
+
+  async answer(req) {
+    const res = await fetch("/api/answer", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`answer: ${res.status} ${await res.text()}`);
+    return (await res.json()) as AnswerResponse;
+  },
+
+  async *rpcStream(req) {
+    const res = await fetch("/api/rpc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) throw new Error(`rpcStream: ${res.status} ${await res.text()}`);
+    const data = (await res.json()) as RpcEvent[];
+    for (const ev of data) {
+      yield ev;
+    }
+  },
 
   // The real live transport is browser-driven `<img>` polling against
   // `liveJpegUrl(cameraId)`. This generator only emits LiveFrame ticks for
@@ -188,7 +174,17 @@ export const httpClient: ApiClient = {
     }
   },
 
-  clipUrl: mockClient.clipUrl,
+  clipUrl(chunkId) {
+    return `/api/clips/${encodeURIComponent(chunkId)}`;
+  },
+
+  async playback(cameraId, startTsMs) {
+    const qs = new URLSearchParams({ camera_id: cameraId });
+    if (startTsMs !== undefined) qs.set("start_ts_ms", String(startTsMs));
+    const res = await fetch(`/api/playback?${qs.toString()}`);
+    if (!res.ok) throw new Error(`playback: ${res.status}`);
+    return (await res.json()) as PlaybackInfo;
+  },
 };
 
 export const api: ApiClient = httpClient;

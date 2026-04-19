@@ -13,6 +13,11 @@
 
 #[cfg(feature = "cactus")]
 mod cactus;
+mod chroma;
+mod gemini;
+#[cfg(feature = "cactus")]
+mod query;
+mod store;
 
 use std::{
     collections::HashMap,
@@ -45,6 +50,10 @@ use tokio::sync::{mpsc, oneshot};
 
 #[cfg(feature = "cactus")]
 use crate::cactus::CactusModel;
+use crate::gemini::GeminiEmbedClient;
+#[cfg(feature = "cactus")]
+use crate::query::CactusQueryHandler;
+use crate::store::{EmbeddingStore, QueryFilter, SearchModality};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
@@ -76,13 +85,40 @@ struct Args {
 
     /// Path to the Cactus-converted Gemma weights directory. When the
     /// `cactus` feature is on, this model is loaded at startup and used
-    /// to answer `POST /api/query`. Ignored without the feature.
+    /// to answer `POST /api/query`. Ignored without the feature. No
+    /// built-in default — set `CACTUS_MODEL_PATH` (or `GEMMA_MODEL_PATH`)
+    /// in your environment, or pass `--model-path`.
     #[arg(
         long,
-        env = "GEMMA_MODEL_PATH",
-        default_value = "/Users/danielargento/cactus/weights/gemma-4-e2b-it"
+        env = "CACTUS_MODEL_PATH",
+        default_value = "weights/gemma-4-e2b-it"
     )]
     model_path: PathBuf,
+
+    /// Max embedding chunks to retain in memory (older chunks evicted first).
+    #[arg(long, env = "STORE_MAX_SIZE", default_value_t = 10_000)]
+    store_max_size: usize,
+
+    /// Directory for persistent embedding storage. Chunks and thumbnails
+    /// are written here and reloaded on restart.
+    #[arg(long, env = "STORE_DIR", default_value = ".store")]
+    store_dir: PathBuf,
+
+    /// Directory where HLS recordings land (same path the follower writes
+    /// to in the co-located demo setup). Served under `/api/recordings/`.
+    #[arg(long, env = "LEADER_RECORDINGS_DIR", default_value = "./recordings")]
+    recordings_dir: PathBuf,
+
+    /// ChromaDB server URL. Start one with: `uvx --from chromadb chroma run`
+    /// Set to empty string to disable ChromaDB.
+    #[arg(long, env = "CHROMA_URL", default_value = "http://localhost:8000")]
+    chroma_url: String,
+
+    /// Gemini API key for embedding user queries. Required for vector
+    /// similarity search. Without it, queries fall back to recency-based
+    /// retrieval.
+    #[arg(long, env = "GEMINI_API_KEY")]
+    gemini_api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -101,6 +137,7 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .discovery_n0()
+        .alpns(vec![INGEST_ALPN.to_vec()])
         .bind()
         .await?;
 
@@ -123,7 +160,45 @@ async fn main() -> Result<()> {
     println!("  endpoint id: {id}");
     println!("  ticket file: {}", args.ticket_file.display());
     println!("  http on:     http://{}", args.http_addr);
-    println!("  ticket (share with remote followers):\n\n{ticket_str}\n");
+    println!("  ticket:\n\n{ticket_str}\n");
+    println!("  == HOW TO CONNECT ==");
+    println!("  1. From this computer (Local):");
+    println!("     cargo run --release -p follower -- --camera-id cam-local");
+    println!("  2. From another computer (Remote):");
+    println!("     cargo run --release -p follower -- {ticket_str} --camera-id cam-partner\n");
+
+    // Connect to ChromaDB per-modality collections (PRD §5.2).
+    let chroma = if !args.chroma_url.is_empty() {
+        match chroma::ChromaCollections::connect(&args.chroma_url).await {
+            Ok(c) => {
+                info!(url = %args.chroma_url, "chromadb collections connected");
+                Some(c)
+            }
+            Err(e) => {
+                warn!(url = %args.chroma_url, error = %e,
+                    "chromadb connection failed — using brute-force search. \
+                     Start chroma with: uvx --from chromadb chroma run");
+                None
+            }
+        }
+    } else {
+        info!("chromadb disabled (empty --chroma-url)");
+        None
+    };
+
+    let store = Arc::new(
+        EmbeddingStore::open(&args.store_dir, args.store_max_size, chroma)
+            .with_context(|| format!("open store at {}", args.store_dir.display()))?,
+    );
+
+    // Build the Gemini embedding client for query-time text embedding.
+    let gemini_embed = args.gemini_api_key.as_ref().map(|key| {
+        info!("gemini query embedding enabled");
+        Arc::new(GeminiEmbedClient::new(key.clone()))
+    });
+    if gemini_embed.is_none() {
+        warn!("no GEMINI_API_KEY — queries will fail unless built with --features cactus");
+    }
 
     // Load Gemma up front. If it fails, log and keep serving — the rest
     // of the leader (camera registry, live snapshots) still works.
@@ -153,9 +228,25 @@ async fn main() -> Result<()> {
         next_req_id: Arc::new(AtomicU64::new(1)),
         chunks_total: Arc::new(AtomicU64::new(0)),
         frame_timeout: Duration::from_millis(args.frame_timeout_ms),
+        store,
+        gemini_embed,
         #[cfg(feature = "cactus")]
         llm,
+        embed_cache: Arc::new(RwLock::new(EmbedCache::default())),
+        recordings_dir: args.recordings_dir.clone(),
     };
+
+    // Make sure the recordings dir exists so ServeDir doesn't 500 before
+    // the follower has written its first segment.
+    if let Err(e) = std::fs::create_dir_all(&args.recordings_dir) {
+        warn!(
+            dir = %args.recordings_dir.display(),
+            error = %e,
+            "failed to create recordings dir"
+        );
+    } else {
+        info!(dir = %args.recordings_dir.display(), "recordings served at /api/recordings");
+    }
 
     let handler = IngestHandler {
         state: app_state.clone(),
@@ -277,8 +368,46 @@ struct AppState {
     next_req_id: Arc<AtomicU64>,
     chunks_total: Arc<AtomicU64>,
     frame_timeout: Duration,
+    store: Arc<EmbeddingStore>,
+    /// Gemini client for embedding query text. `None` when no API key is
+    /// set — queries fall back to recency ranking.
+    gemini_embed: Option<Arc<GeminiEmbedClient>>,
     #[cfg(feature = "cactus")]
     llm: Option<Arc<CactusModel>>,
+    /// Small LRU-ish cache for query-text → embedding. The embed step
+    /// (local Cactus or Gemini API) is the slowest part of search after
+    /// LLM synthesis is skipped, so caching repeat queries helps a lot
+    /// when iterating on the Image Search debug page.
+    embed_cache: Arc<RwLock<EmbedCache>>,
+    /// Where HLS recordings live on disk — served under `/api/recordings/`
+    /// and referenced by `/api/playback` to map retrieval timestamps back
+    /// to a playlist URL.
+    recordings_dir: PathBuf,
+}
+
+#[derive(Default)]
+struct EmbedCache {
+    entries: HashMap<String, Arc<Vec<f32>>>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl EmbedCache {
+    const MAX: usize = 128;
+    fn get(&self, key: &str) -> Option<Arc<Vec<f32>>> {
+        self.entries.get(key).cloned()
+    }
+    fn put(&mut self, key: String, val: Arc<Vec<f32>>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.order.len() >= Self::MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, val);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -351,6 +480,29 @@ async fn serve_stream(
     remote: String,
 ) -> Result<()> {
     let (req_tx, mut req_rx) = mpsc::channel::<FrameReq>(64);
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<LeaderMsg>(128);
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if let Err(e) = write_frame(&mut send, &msg).await {
+                error!(%e, "writer task send failed - network connection might have dropped concurrently");
+                break;
+            }
+        }
+        let _ = send.finish();
+    });
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let res = read_frame::<_, FollowerMsg>(&mut recv).await;
+            let is_err_or_eof = res.is_err() || matches!(res, Ok(None));
+            if inbound_tx.send(res).await.is_err() || is_err_or_eof {
+                break;
+            }
+        }
+    });
+
     let mut pending: HashMap<u64, oneshot::Sender<FrameOutcome>> = HashMap::new();
     let mut camera_id: Option<String> = None;
     let mut entry: Option<CameraEntry> = None;
@@ -358,11 +510,19 @@ async fn serve_stream(
     loop {
         tokio::select! {
             // Inbound traffic from the follower.
-            msg = read_frame::<_, FollowerMsg>(&mut recv) => {
-                let msg = match msg {
+            opt = inbound_rx.recv() => {
+                let Some(msg_res) = opt else { break; };
+                let msg = match msg_res {
                     Ok(Some(m)) => m,
-                    Ok(None) => break,
-                    Err(e) => { warn!(%e, "stream read failed"); break; }
+                    Ok(None) => {
+                        debug!("clean EOF from follower stream");
+                        break;
+                    }
+                    Err(e) => {
+                        let cid_str = camera_id.as_deref().unwrap_or("<unknown>");
+                        error!(camera_id = %cid_str, %remote, %e, "stream read failed - remote connection likely severed or frame excessively large");
+                        break;
+                    }
                 };
                 match msg {
                     FollowerMsg::Hello { camera_id: cid } => {
@@ -388,17 +548,20 @@ async fn serve_stream(
                             e.chunks_total.fetch_add(1, Ordering::Relaxed);
                             e.last_seen_ms.store(now_ms(), Ordering::Relaxed);
                         }
+                        state.store.push(chunk.clone());
+                        state.store.sync_to_chroma(&chunk).await;
                         info!(
                             total = n,
                             camera = %chunk.camera_id,
                             chunk = %chunk.chunk_id,
                             dim = chunk.embedding.len(),
+                            video_dim = chunk.video_dim,
+                            audio_dim = chunk.audio_dim,
                             caption = chunk.caption.as_deref().unwrap_or(""),
                             "recv chunk",
                         );
                         let ack = LeaderMsg::Ack { chunk_id: chunk.chunk_id };
-                        if let Err(e) = write_frame(&mut send, &ack).await {
-                            error!(%e, "ack write failed");
+                        if outbound_tx.send(ack).await.is_err() {
                             break;
                         }
                     }
@@ -430,23 +593,25 @@ async fn serve_stream(
             // Outbound: HTTP layer asked for a frame.
             Some(req) = req_rx.recv() => {
                 pending.insert(req.req_id, req.response_tx);
-                if let Err(e) = write_frame(&mut send, &LeaderMsg::FrameRequest { req_id: req.req_id }).await {
-                    warn!(%e, "frame request write failed");
-                    if let Some(tx) = pending.remove(&req.req_id) {
-                        let _ = tx.send(FrameOutcome::Err(format!("write failed: {e}")));
-                    }
+                if outbound_tx.send(LeaderMsg::FrameRequest { req_id: req.req_id }).await.is_err() {
                     break;
                 }
             }
         }
     }
 
+    writer_task.abort();
+    reader_task.abort();
+
     // Cleanup: drop the registration so HTTP requests stop landing here, and
     // cancel any pending oneshots so callers see an error instead of hanging.
     if let Some(cid) = &camera_id {
         let mut reg = state.registry.write().expect("registry poisoned");
         if let Some(existing) = reg.get(cid) {
-            if Arc::ptr_eq(&existing.last_seen_ms, &entry.as_ref().unwrap().last_seen_ms) {
+            if Arc::ptr_eq(
+                &existing.last_seen_ms,
+                &entry.as_ref().unwrap().last_seen_ms,
+            ) {
                 reg.remove(cid);
                 info!(camera = %cid, "deregistered");
             }
@@ -466,10 +631,19 @@ async fn serve_http(addr: SocketAddr, state: AppState) -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let recordings_service = tower_http::services::ServeDir::new(&state.recordings_dir)
+        .precompressed_gzip()
+        .append_index_html_on_directories(false);
+
     let app = Router::new()
         .route("/api/cameras", get(list_cameras))
         .route("/api/live/:camera_id", get(live_jpg))
+        .route("/api/thumbnail/:chunk_id", get(thumbnail))
         .route("/api/query", post(query))
+        .route("/api/search", post(search))
+        .route("/api/answer", post(answer))
+        .route("/api/playback", get(playback))
+        .nest_service("/api/recordings", recordings_service)
         .layer(cors)
         .with_state(state);
 
@@ -521,16 +695,16 @@ async fn list_cameras(State(state): State<AppState>) -> Json<Vec<CameraJson>> {
     Json(out)
 }
 
-async fn live_jpg(
-    State(state): State<AppState>,
-    AxPath(camera_id): AxPath<String>,
-) -> Response {
+async fn live_jpg(State(state): State<AppState>, AxPath(camera_id): AxPath<String>) -> Response {
     let req_tx = {
         let reg = state.registry.read().expect("registry poisoned");
         match reg.get(&camera_id) {
             Some(e) => e.request_tx.clone(),
             None => {
-                return (StatusCode::NOT_FOUND, format!("camera '{camera_id}' not online"))
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("camera '{camera_id}' not online"),
+                )
                     .into_response();
             }
         }
@@ -539,7 +713,10 @@ async fn live_jpg(
     let req_id = state.next_req_id.fetch_add(1, Ordering::Relaxed);
     let (otx, orx) = oneshot::channel();
     if req_tx
-        .send(FrameReq { req_id, response_tx: otx })
+        .send(FrameReq {
+            req_id,
+            response_tx: otx,
+        })
         .await
         .is_err()
     {
@@ -559,9 +736,7 @@ async fn live_jpg(
             snap.jpeg,
         )
             .into_response(),
-        Ok(Ok(FrameOutcome::Err(msg))) => {
-            (StatusCode::BAD_GATEWAY, msg).into_response()
-        }
+        Ok(Ok(FrameOutcome::Err(msg))) => (StatusCode::BAD_GATEWAY, msg).into_response(),
         Ok(Err(_recv_err)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "follower closed before frame arrived",
@@ -571,101 +746,503 @@ async fn live_jpg(
     }
 }
 
-// ──────────────────────────── query (LLM) ────────────────────────────
+// ──────────────────────────── thumbnail ──────────────────────────────
+
+/// Serves the representative JPEG thumbnail stored on disk.
+async fn thumbnail(
+    State(state): State<AppState>,
+    AxPath(chunk_id): AxPath<String>,
+) -> Response {
+    match state.store.get_thumbnail(&chunk_id) {
+        Some(jpeg) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg"),
+                (header::CACHE_CONTROL, "public, max-age=3600, immutable"),
+            ],
+            jpeg,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no thumbnail for this chunk").into_response(),
+    }
+}
+
+// ──────────────────────────── playback ──────────────────────────────
+
+#[derive(Deserialize)]
+struct PlaybackParams {
+    camera_id: String,
+    /// Wall-clock ms the UI wants to start playing at. Echoed back so the
+    /// client can seek via HLS PROGRAM-DATE-TIME without computing offsets
+    /// itself.
+    start_ts_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PlaybackResp {
+    camera_id: String,
+    /// URL the UI feeds to hls.js.
+    playlist_url: String,
+    /// Echoed back unchanged; the UI uses it to seek the player.
+    start_ts_ms: Option<u64>,
+    /// Whether the playlist file exists on disk right now. Lets the UI
+    /// show a "no recording yet" state instead of a cryptic 404 from
+    /// hls.js.
+    available: bool,
+}
+
+/// Resolve `(camera_id, start_ts_ms)` → HLS playlist URL. The recording is
+/// a single rolling playlist per camera; playback UX (seeking to the exact
+/// start_ts_ms, continuing forward) is handled client-side via the
+/// `#EXT-X-PROGRAM-DATE-TIME` tags that ffmpeg emits.
+async fn playback(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<PlaybackParams>,
+) -> Json<PlaybackResp> {
+    // Basic sanitization — camera_id becomes a path segment. Reject
+    // anything containing path traversal characters.
+    let camera_id = params.camera_id;
+    let clean = !camera_id.is_empty()
+        && !camera_id.contains('/')
+        && !camera_id.contains('\\')
+        && !camera_id.contains("..");
+    let playlist_url = if clean {
+        format!("/api/recordings/{}/stream.m3u8", camera_id)
+    } else {
+        String::new()
+    };
+    let available = clean
+        && state
+            .recordings_dir
+            .join(&camera_id)
+            .join("stream.m3u8")
+            .is_file();
+    Json(PlaybackResp {
+        camera_id,
+        playlist_url,
+        start_ts_ms: params.start_ts_ms,
+        available,
+    })
+}
+
+// ──────────────────────────── query (RAG) ────────────────────────────
 
 #[derive(Deserialize)]
 struct QueryReq {
     query: String,
     #[serde(default)]
-    #[allow(dead_code)]
     cameras: Option<Vec<String>>,
     #[serde(default)]
-    #[allow(dead_code)]
+    time_range: Option<TimeRange>,
+    #[serde(default)]
     top_k: Option<u32>,
+    #[serde(default)]
+    modalities: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct TimeRange {
+    from_ms: u64,
+    to_ms: u64,
 }
 
 #[derive(Serialize)]
 struct QueryResp {
     answer: String,
-    citations: Vec<serde_json::Value>,
-    hits: Vec<serde_json::Value>,
+    citations: Vec<CitationJson>,
+    hits: Vec<HitJson>,
+}
+
+#[derive(Serialize)]
+struct CitationJson {
+    camera_id: String,
+    chunk_id: String,
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+}
+
+#[derive(Serialize)]
+struct HitJson {
+    chunk_id: String,
+    camera_id: String,
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+    caption: Option<String>,
+    score: f32,
+    thumbnail_url: Option<String>,
+}
+
+/// Shared retrieval logic: embed the query text via local Cactus/Gemma
+/// (preferred) or Gemini API, then search the store by cosine similarity.
+async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredChunk>> {
+    // Embed the query text for vector search.
+    // Priority: 1) local Cactus/Gemma  2) Gemini API
+    let query_embedding = embed_query(state, &req.query).await?;
+
+    // Determine search modality from the request. When the UI sends
+    // `["video","audio"]` (or an explicit "all", or an empty/missing
+    // field), default to `All` so both Chroma collections get queried
+    // and results are RRF-merged. Only collapse to a single modality
+    // when the user unambiguously asked for one.
+    let modality = match &req.modalities {
+        Some(mods) if !mods.is_empty() => {
+            let has_video = mods.iter().any(|m| m.eq_ignore_ascii_case("video"));
+            let has_audio = mods.iter().any(|m| m.eq_ignore_ascii_case("audio"));
+            let has_all = mods.iter().any(|m| m.eq_ignore_ascii_case("all"));
+            match (has_all, has_video, has_audio) {
+                (true, _, _) => SearchModality::All,
+                (_, true, false) => SearchModality::Video,
+                (_, false, true) => SearchModality::Audio,
+                _ => SearchModality::All,
+            }
+        }
+        // No modality filter from caller → search everything.
+        _ => SearchModality::All,
+    };
+
+    let filter = QueryFilter {
+        query_embedding: Some(query_embedding),
+        time_start_ms: req.time_range.as_ref().map(|tr| tr.from_ms),
+        time_end_ms: req.time_range.as_ref().map(|tr| tr.to_ms),
+        camera_ids: req.cameras.clone(),
+        top_k: req.top_k.map(|k| k as usize).unwrap_or(20),
+        modality,
+        caption_query: Some(req.query.clone()),
+    };
+
+    Ok(state.store.query_async(&filter).await)
+}
+
+/// Embed query text for vector search. Uses local Cactus model when
+/// available (no network round-trip), Gemini API as fallback. Results are
+/// cached in `state.embed_cache` keyed by the raw query string.
+#[cfg(feature = "cactus")]
+async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
+    // 0) Fast path: cached embedding for this exact query.
+    if let Some(cached) = state.embed_cache.read().ok().and_then(|c| c.get(query)) {
+        info!(dim = cached.len(), "query embedding served from cache");
+        return Ok((*cached).clone());
+    }
+
+    // 1) Try local Cactus/Gemma text embedding (fast, no API key needed).
+    if let Some(ref model) = state.llm {
+        let model = Arc::clone(model);
+        let text = query.to_string();
+        match tokio::task::spawn_blocking(move || model.embed_text(&text, true)).await {
+            Ok(Ok(vec)) => {
+                info!(dim = vec.len(), "query embedded via local cactus/gemma");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
+                return Ok(vec);
+            }
+            Ok(Err(e)) => {
+                warn!(%e, "cactus text embed failed, trying gemini");
+            }
+            Err(e) => {
+                warn!(%e, "cactus embed task panicked, trying gemini");
+            }
+        }
+    }
+
+    // 2) Gemini API.
+    if let Some(ref client) = state.gemini_embed {
+        match client.embed_text(query).await {
+            Ok(vec) => {
+                info!(dim = vec.len(), "query embedded via gemini API");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
+                return Ok(vec);
+            }
+            Err(e) => {
+                warn!(%e, "gemini query embedding also failed");
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "no embedding backend available for query. Set GEMINI_API_KEY or build with --features cactus."
+    )
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn embed_query(state: &AppState, query: &str) -> Result<Vec<f32>> {
+    if let Some(cached) = state.embed_cache.read().ok().and_then(|c| c.get(query)) {
+        info!(dim = cached.len(), "query embedding served from cache");
+        return Ok((*cached).clone());
+    }
+    if let Some(ref client) = state.gemini_embed {
+        match client.embed_text(query).await {
+            Ok(vec) => {
+                info!(dim = vec.len(), "query embedded via gemini API");
+                if let Ok(mut c) = state.embed_cache.write() {
+                    c.put(query.to_string(), Arc::new(vec.clone()));
+                }
+                return Ok(vec);
+            }
+            Err(e) => {
+                anyhow::bail!("query text embedding failed: {e}. Check your GEMINI_API_KEY.");
+            }
+        }
+    }
+    anyhow::bail!(
+        "no embedding backend available for query. Set GEMINI_API_KEY or build with --features cactus."
+    )
+}
+
+fn scored_to_hits(scored: &[store::ScoredChunk]) -> (Vec<HitJson>, Vec<CitationJson>) {
+    let hits: Vec<HitJson> = scored
+        .iter()
+        .map(|sc| {
+            let c = &sc.chunk.chunk;
+            HitJson {
+                chunk_id: c.chunk_id.clone(),
+                camera_id: c.camera_id.clone(),
+                start_ts_ms: c.start_ts_ms,
+                end_ts_ms: c.end_ts_ms,
+                caption: c.caption.clone(),
+                score: sc.score,
+                thumbnail_url: if sc.chunk.has_thumbnail {
+                    Some(format!("/api/thumbnail/{}", c.chunk_id))
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
+
+    let citations: Vec<CitationJson> = scored
+        .iter()
+        .filter(|sc| sc.score > 0.3 || sc.score == 0.0)
+        .map(|sc| {
+            let c = &sc.chunk.chunk;
+            CitationJson {
+                camera_id: c.camera_id.clone(),
+                chunk_id: c.chunk_id.clone(),
+                start_ts_ms: c.start_ts_ms,
+                end_ts_ms: c.end_ts_ms,
+            }
+        })
+        .collect();
+
+    (hits, citations)
 }
 
 #[cfg(feature = "cactus")]
-async fn query(
-    State(state): State<AppState>,
-    Json(req): Json<QueryReq>,
-) -> Response {
-    let Some(model) = state.llm.clone() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "gemma model not loaded on this leader",
-        )
-            .into_response();
-    };
+async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
     if req.query.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty query").into_response();
     }
 
-    // Build messages identically to `examples/chat.rs` (which is known to
-    // work). Gemma-it chat templates don't accept a `system` role — if you
-    // include one the model ignores the user turn and replies "please
-    // provide a question".
-    let escaped = req.query.replace('\\', "\\\\").replace('"', "\\\"");
-    let messages = format!(r#"[{{"role":"user","content":"{}"}}]"#, escaped);
-    eprintln!(">>> gemma messages: {messages}");
-    info!(messages = %messages, "sending to gemma");
-    let options = r#"{"max_tokens":2048}"#.to_string();
-
-    let out = tokio::task::spawn_blocking(move || {
-        model.complete(&messages, Some(&options))
-    })
-    .await;
-
-    let raw = match out {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            error!(%e, "cactus_complete failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("gemma error: {e}"))
-                .into_response();
-        }
+    // Step 1: Retrieve by vector similarity (or recency fallback).
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
         Err(e) => {
-            error!(%e, "cactus task panicked");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "gemma task panicked")
+            error!(%e, "retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
                 .into_response();
         }
     };
+    let n_chunks = scored.len();
+    let (hits, citations) = scored_to_hits(&scored);
+    info!(n_chunks, query = %req.query, "query: retrieval complete");
 
-    eprintln!("<<< gemma raw: {raw}");
-    info!(raw = %raw, "gemma raw response");
-    // Cactus returns a JSON blob with a `response` field plus timing
-    // stats. Extract just the answer text; fall back to the raw blob
-    // if parsing fails.
-    let answer = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(|s| s.to_string()))
-        .unwrap_or(raw);
+    // Step 2: LLM synthesis (if cactus model available).
+    let stored: Vec<store::StoredChunk> = scored.iter().map(|sc| sc.chunk.clone()).collect();
+    let answer = if let Some(model) = state.llm.clone() {
+        let handler = CactusQueryHandler::new(model);
+        match handler.synthesize_answer(&req.query, &stored, &state.store).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%e, "LLM synthesis failed, returning retrieval-only results");
+                format!("Found {} relevant chunks but LLM synthesis failed.", n_chunks)
+            }
+        }
+    } else {
+        format!("Found {} relevant chunks (LLM not loaded for synthesis).", n_chunks)
+    };
 
-    Json(QueryResp {
-        answer,
-        citations: Vec::new(),
-        hits: Vec::new(),
+    info!(n_chunks, "query answered");
+    Json(QueryResp { answer, citations, hits }).into_response()
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn query(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+
+    // Retrieve by vector similarity (or recency fallback).
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(%e, "retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
+                .into_response();
+        }
+    };
+    let n_chunks = scored.len();
+    let (hits, citations) = scored_to_hits(&scored);
+    info!(n_chunks, query = %req.query, "query: retrieval complete (no LLM)");
+
+    let answer = format!(
+        "Found {} relevant chunks. Build with --features cactus for LLM-synthesized answers.",
+        n_chunks
+    );
+
+    Json(QueryResp { answer, citations, hits }).into_response()
+}
+
+/// Retrieval-only endpoint: embeds the query and runs vector search, but
+/// skips LLM synthesis. Used by the Image Search debug UI and any caller
+/// that just wants hits (no generated answer). This is dramatically faster
+/// than `/api/query` because it avoids the Gemma generation step.
+#[derive(Serialize)]
+struct SearchResp {
+    hits: Vec<HitJson>,
+    took_ms: u64,
+}
+
+async fn search(State(state): State<AppState>, Json(req): Json<QueryReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+    let scored = match retrieve(&state, &req).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(%e, "search retrieval failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("retrieval error: {e}"))
+                .into_response();
+        }
+    };
+    let (hits, _citations) = scored_to_hits(&scored);
+    let took_ms = t0.elapsed().as_millis() as u64;
+    info!(n_hits = hits.len(), took_ms, query = %req.query, "search complete");
+    Json(SearchResp { hits, took_ms }).into_response()
+}
+
+/// LLM-synthesis-only endpoint. Takes a question plus a set of chunk IDs
+/// (typically returned by `/api/search`) and runs the Cactus/Gemma answer
+/// synthesis. Lets the UI split a "query" into a fast retrieval phase
+/// (shown immediately) and a slower synthesis phase (filled in when
+/// ready) for much better perceived latency.
+#[derive(Deserialize)]
+struct AnswerReq {
+    query: String,
+    #[serde(default)]
+    chunk_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AnswerResp {
+    answer: String,
+    citations: Vec<CitationJson>,
+    took_ms: u64,
+}
+
+#[cfg(feature = "cactus")]
+async fn answer(State(state): State<AppState>, Json(req): Json<AnswerReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+
+    // Rehydrate the StoredChunks for the supplied IDs, preserving order.
+    let chunks: Vec<store::StoredChunk> = req
+        .chunk_ids
+        .iter()
+        .filter_map(|id| state.store.get_by_id(id))
+        .collect();
+
+    let citations: Vec<CitationJson> = chunks
+        .iter()
+        .map(|sc| CitationJson {
+            camera_id: sc.chunk.camera_id.clone(),
+            chunk_id: sc.chunk.chunk_id.clone(),
+            start_ts_ms: sc.chunk.start_ts_ms,
+            end_ts_ms: sc.chunk.end_ts_ms,
+        })
+        .collect();
+
+    let answer_text = if let Some(model) = state.llm.clone() {
+        let handler = CactusQueryHandler::new(model);
+        match handler.synthesize_answer(&req.query, &chunks, &state.store).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(%e, "LLM synthesis failed");
+                format!("LLM synthesis failed: {e}")
+            }
+        }
+    } else {
+        "LLM not loaded.".to_string()
+    };
+
+    let took_ms = t0.elapsed().as_millis() as u64;
+    info!(n_chunks = chunks.len(), took_ms, "answer complete");
+    Json(AnswerResp { answer: answer_text, citations, took_ms }).into_response()
+}
+
+#[cfg(not(feature = "cactus"))]
+async fn answer(State(state): State<AppState>, Json(req): Json<AnswerReq>) -> Response {
+    if req.query.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty query").into_response();
+    }
+    let t0 = std::time::Instant::now();
+    let citations: Vec<CitationJson> = req
+        .chunk_ids
+        .iter()
+        .filter_map(|id| state.store.get_by_id(id))
+        .map(|sc| CitationJson {
+            camera_id: sc.chunk.camera_id.clone(),
+            chunk_id: sc.chunk.chunk_id.clone(),
+            start_ts_ms: sc.chunk.start_ts_ms,
+            end_ts_ms: sc.chunk.end_ts_ms,
+        })
+        .collect();
+    let took_ms = t0.elapsed().as_millis() as u64;
+    Json(AnswerResp {
+        answer: "Build with --features cactus for LLM-synthesized answers.".into(),
+        citations,
+        took_ms,
     })
     .into_response()
 }
 
-#[cfg(not(feature = "cactus"))]
-async fn query(
-    State(_state): State<AppState>,
-    Json(req): Json<QueryReq>,
-) -> Response {
-    Json(QueryResp {
-        answer: format!(
-            "(cactus feature disabled — echoing) {}",
-            req.query
-        ),
-        citations: Vec::new(),
-        hits: Vec::new(),
-    })
-    .into_response()
+#[cfg(test)]
+mod tests {
+    use crate::store::{EmbeddingStore, QueryFilter, SearchModality};
+    use common::EmbeddingChunk;
+    use std::sync::Arc;
+
+    fn make_chunk(camera_id: &str, ts_ms: u64) -> EmbeddingChunk {
+        EmbeddingChunk {
+            chunk_id: format!("{camera_id}-{ts_ms}"),
+            camera_id: camera_id.into(),
+            start_ts_ms: ts_ms,
+            end_ts_ms: ts_ms + 5000,
+            embedding: vec![0.1, 0.2],
+            video_dim: 2,
+            audio_dim: 0,
+            caption: None,
+            representative_jpeg: None,
+        }
+    }
+
+    #[test]
+    fn store_accessible_and_chunks_persist() {
+        let store = Arc::new(EmbeddingStore::new(1000));
+        store.push(make_chunk("cam-0", 1000));
+        store.push(make_chunk("cam-0", 6000));
+        let results = store.query(&QueryFilter {
+            query_embedding: None,
+            time_start_ms: None,
+            time_end_ms: None,
+            camera_ids: None,
+            top_k: 10,
+            modality: SearchModality::default(),
+            caption_query: None,
+        });
+        assert_eq!(results.len(), 2);
+    }
 }

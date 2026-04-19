@@ -9,6 +9,9 @@ Cargo.lock.bak
 /weights/
 .venv/
 
+recordings/
+frames/
+thumbnails/
 .store
 .chroma
 recordings

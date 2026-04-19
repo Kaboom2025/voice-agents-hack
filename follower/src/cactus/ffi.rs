@@ -14,6 +14,12 @@ use std::os::raw::{c_char, c_float, c_int, c_void};
 /// Opaque handle returned by [`cactus_init`]. Pass to every other API.
 pub type CactusModel = *mut c_void;
 
+/// Optional streaming-token callback. The follower never uses it but we
+/// declare the type so the `cactus_complete` signature matches.
+#[allow(dead_code)]
+pub type CactusTokenCallback =
+    Option<unsafe extern "C" fn(token: *const c_char, token_id: u32, user_data: *mut c_void)>;
+
 unsafe extern "C" {
     /// Load a model from disk. `model_path` is a directory holding the
     /// per-tensor `.weights` files (e.g. gemma-4-e2b-it). `corpus_dir`
@@ -52,7 +58,35 @@ unsafe extern "C" {
         dim_out: *mut usize,
     ) -> c_int;
 
+    /// Audio embedding. `audio_path` is a filesystem path to a WAV file
+    /// (16 kHz mono PCM expected). Returns the pre-pooled audio
+    /// representation; callers mean-pool and L2-normalize downstream.
+    pub fn cactus_audio_embed(
+        model: CactusModel,
+        audio_path: *const c_char,
+        buf: *mut c_float,
+        buf_size: usize,
+        dim_out: *mut usize,
+    ) -> c_int;
+
     /// Last error message set by any of the above calls. Pointer is
     /// owned by the lib; do not free. Valid until the next FFI call.
     pub fn cactus_get_last_error() -> *const c_char;
+
+    /// Chat completion. Writes a NUL-terminated JSON response string
+    /// into `response_buffer`. Returns 0+ on success, negative on error.
+    /// The follower uses this to produce per-chunk captions via the
+    /// vision-capable Gemma model before text-embedding them.
+    pub fn cactus_complete(
+        model: CactusModel,
+        messages_json: *const c_char,
+        response_buffer: *mut c_char,
+        buffer_size: usize,
+        options_json: *const c_char,
+        tools_json: *const c_char,
+        callback: CactusTokenCallback,
+        user_data: *mut c_void,
+        pcm_buffer: *const u8,
+        pcm_buffer_size: usize,
+    ) -> c_int;
 }

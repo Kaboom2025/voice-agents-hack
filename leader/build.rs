@@ -15,7 +15,12 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Load .env from the workspace root (one level up from this crate).
+    // Real env vars always win over .env values.
+    let _ = dotenvy::from_filename("../.env");
+
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../.env");
     println!("cargo:rerun-if-env-changed=CACTUS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=CACTUS_PREFIX");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CACTUS");
@@ -33,7 +38,8 @@ fn main() {
             v.push(PathBuf::from(p).join("lib"));
         }
         if let Some(home) = std::env::var_os("HOME") {
-            v.push(PathBuf::from(home).join("cactus/cactus/build"));
+            v.push(PathBuf::from(&home).join("cactus/cactus/build"));
+            v.push(PathBuf::from(&home).join("Documents/cactus/cactus/build"));
         }
         v.push(PathBuf::from("/opt/homebrew/opt/cactus/lib"));
         v
@@ -43,9 +49,7 @@ fn main() {
         .into_iter()
         .find(|d| d.join("libcactus.dylib").exists())
     else {
-        println!(
-            "cargo:warning=libcactus.dylib not found; set CACTUS_LIB_DIR or CACTUS_PREFIX"
-        );
+        println!("cargo:warning=libcactus.dylib not found; set CACTUS_LIB_DIR or CACTUS_PREFIX");
         return;
     };
 

@@ -1,27 +1,64 @@
-import { api, type ClipHit } from "../api";
+import { type ClipHit } from "../api";
 
-export function ResultCard({ hit }: { hit: ClipHit }) {
+export function ResultCard({ hit, rank, onOpen }: { hit: ClipHit; rank?: number; onOpen?: () => void }) {
   const start = new Date(hit.start_ts_ms);
+  const scorePct = Math.round(hit.score * 100);
+  const scoreColor =
+    scorePct >= 70 ? "bg-emerald-500" : scorePct >= 40 ? "bg-amber-500" : "bg-slate-400";
+
   return (
-    <a
-      href={api.clipUrl(hit.chunk_id)}
-      className="block glass rounded-2xl overflow-hidden hover:shadow-glass hover:-translate-y-0.5 transition-all"
+    <div
+      className="group relative glass rounded-2xl overflow-hidden hover:shadow-glass hover:-translate-y-0.5 transition-all cursor-pointer"
+      onClick={onOpen}
+      role={onOpen ? "button" : undefined}
     >
-      <div className="aspect-video bg-slate-100 grid place-items-center text-mute text-xs font-mono">
+      {/* Thumbnail */}
+      <div className="aspect-video bg-slate-900 relative">
         {hit.thumbnail_url ? (
-          <img src={hit.thumbnail_url} alt="" className="w-full h-full object-cover" />
+          <img
+            src={hit.thumbnail_url}
+            alt={`${hit.camera_id} at ${start.toLocaleTimeString()}`}
+            className="absolute inset-0 w-full h-full object-cover"
+          />
         ) : (
-          "thumbnail"
+          <div className="absolute inset-0 grid place-items-center text-slate-500 text-xs font-mono">
+            no thumbnail
+          </div>
         )}
-      </div>
-      <div className="p-3 space-y-1">
-        <div className="flex items-center justify-between text-[11px] font-mono text-mute">
-          <span>{hit.camera_id}</span>
-          <span>{start.toLocaleTimeString()}</span>
+
+        {/* Score badge */}
+        <div className="absolute top-2 right-2 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-black/70 backdrop-blur-sm">
+          <span className={`size-1.5 rounded-full ${scoreColor}`} />
+          <span className="text-[11px] font-mono text-white/90">
+            {hit.score > 0 ? `${scorePct}%` : "recent"}
+          </span>
         </div>
-        <div className="text-sm leading-snug line-clamp-2 text-ink">{hit.caption ?? "(no caption)"}</div>
-        <div className="text-[10px] text-mute font-mono">score {hit.score.toFixed(2)}</div>
+
+        {/* Rank badge */}
+        {rank !== undefined && (
+          <div className="absolute top-2 left-2 size-6 rounded-full bg-black/70 backdrop-blur-sm grid place-items-center text-[11px] font-mono text-white/90 font-bold">
+            {rank}
+          </div>
+        )}
+
+        {/* Camera ID overlay */}
+        <div className="absolute bottom-2 left-2 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-black/70 backdrop-blur-sm text-[11px] font-mono text-white/90">
+          <span className="size-1.5 rounded-full bg-accent" />
+          {hit.camera_id}
+        </div>
+
+        {/* Timestamp overlay */}
+        <div className="absolute bottom-2 right-2 px-2 py-0.5 rounded-full bg-black/70 backdrop-blur-sm text-[10px] font-mono text-white/80">
+          {start.toLocaleTimeString()}
+        </div>
       </div>
-    </a>
+
+      {/* Caption */}
+      <div className="p-3">
+        <div className="text-sm leading-snug line-clamp-2 text-ink">
+          {hit.caption ?? "(no description)"}
+        </div>
+      </div>
+    </div>
   );
 }

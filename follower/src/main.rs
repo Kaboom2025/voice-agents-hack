@@ -1,9 +1,12 @@
-//! Follower CLI: webcam → Gemini video embedding → iroh QUIC push.
+//! Follower CLI: webcam + mic → Gemini/Cactus embedding → iroh QUIC push.
 //!
-//! Embeds video windows (sliding frames) using GeminiVideoEmbedder, with synthetic
-//! fallback when the API key is unavailable or `--synthetic` is passed.
-//! That keeps the transport testable in CI / headless / no-GPU environments
-//! without changing the wire protocol.
+//! PRD §5.1: each 5 s chunk samples K=4 evenly-spaced frames from the
+//! camera plus the audio segment from the microphone. The embedder
+//! produces a `[video_emb || audio_emb]` vector per chunk.
+//!
+//! Embeds video windows (sliding frames) using `GeminiEmbedder` or
+//! `CactusEmbedder`. Requires either a Cactus/Gemma model or a Gemini
+//! API key — will not start without a real embedding backend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,14 +17,17 @@ use clap::Parser;
 use common::{
     read_frame, write_frame, EmbeddingChunk, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN,
 };
+use follower::audio;
+#[cfg(feature = "cactus")]
+use follower::cactus::CactusModel;
 use follower::camera::{self, CapturedFrame};
-use follower::embedder::GEMINI_EMBED_DIM;
-use follower::frame_buffer::FrameBuffer;
-use follower::gemini_embedder::{
-    GeminiVideoEmbedder, SyntheticVideoEmbedder, VideoEmbedder, VideoEmbeddingOutput,
-};
+use follower::recorder::{self, RecorderConfig};
+#[cfg(feature = "cactus")]
+use follower::embedder::CactusEmbedder;
+use follower::embedder::{ChunkInput, Embedder};
+use follower::gemini_embedder::{encode_jpeg_bytes, GeminiEmbedder};
 use iroh::Endpoint;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 #[derive(Parser, Debug)]
@@ -46,13 +52,21 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     window_ms: u64,
 
-    /// Gemini API key. If set, uses GeminiVideoEmbedder. Falls back to synthetic.
+    /// Gemini API key. If set, uses `GeminiEmbedder` (cloud multimodal
+    /// embedding). Required when Cactus model is not available.
     #[arg(long, env = "GEMINI_API_KEY")]
     gemini_api_key: Option<String>,
 
-    /// Force synthetic random vectors regardless of API key availability.
-    #[arg(long, default_value_t = false)]
-    synthetic: bool,
+    /// Path to the Cactus-converted Gemma weights directory. Used when
+    /// built with `--features cactus` for on-device embedding. Prefer
+    /// setting `CACTUS_MODEL_PATH` in your environment to keep this
+    /// machine-specific path out of CLI scripts.
+    #[arg(
+        long,
+        env = "CACTUS_MODEL_PATH",
+        default_value = "weights/gemma-4-e2b-it"
+    )]
+    model_path: PathBuf,
 
     /// Stop after this many chunks. 0 = run forever.
     #[arg(long, default_value_t = 0)]
@@ -67,10 +81,41 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_camera: bool,
 
+    /// Skip the microphone. Useful in headless / no-audio environments.
+    #[arg(long, default_value_t = false)]
+    no_audio: bool,
+
+    /// Number of evenly-spaced frames to sample per chunk (PRD §5.1 K).
+    #[arg(long, default_value_t = 4)]
+    frames_per_chunk: usize,
+
     /// Directory where captured JPEG frames are written (one file per
     /// chunk, named `<camera-id>-<seq>.jpg`). Created if missing.
     #[arg(long, env = "FOLLOWER_FRAME_DIR", default_value = "./frames")]
     frame_dir: PathBuf,
+
+    /// Directory where HLS recordings are written
+    /// (`<dir>/<camera_id>/stream.m3u8`). In the co-located demo setup
+    /// the leader serves this same path.
+    #[arg(long, env = "FOLLOWER_RECORDINGS_DIR", default_value = "./recordings")]
+    recordings_dir: PathBuf,
+
+    /// Disable HLS recording. Leave enabled to power UI replay.
+    #[arg(long, default_value_t = false)]
+    no_record: bool,
+
+    /// Target framerate for HLS recording (lower = smaller files).
+    #[arg(long, default_value_t = 15)]
+    record_fps: u32,
+
+    /// HLS segment length in seconds.
+    #[arg(long, default_value_t = 4)]
+    record_segment_secs: u32,
+
+    /// Maximum number of reconnection attempts before giving up. 0 = retry
+    /// forever.
+    #[arg(long, default_value_t = 0)]
+    max_retries: u64,
 
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
@@ -104,12 +149,185 @@ async fn main() -> Result<()> {
     }
 
     let ticket: Ticket = ticket_str.parse().context("parse ticket")?;
-    info!(leader = %ticket.leader.node_id, "dialing leader");
 
+    // Ensure the frame directory exists before the first write.
+    std::fs::create_dir_all(&args.frame_dir)
+        .with_context(|| format!("create frame dir {}", args.frame_dir.display()))?;
+    info!(dir = %args.frame_dir.display(), "saving frames");
+
+    // --- Build the embedder (once, reused across reconnects) -----
+    let embedder: Arc<dyn Embedder> = build_embedder(&args).await?;
+
+    // --- Build the frame source (once, reused across reconnects) -
+    let (frames, recorder_rx) = if args.no_camera {
+        info!("frame source: disabled (--no-camera)");
+        (FrameSource::None, None)
+    } else {
+        match camera::spawn(args.device_index) {
+            Ok(handle) => {
+                info!(device = args.device_index, "webcam opened");
+                let rx_for_recorder = handle.rx.clone();
+                (FrameSource::Cam(handle.rx), Some(rx_for_recorder))
+            }
+            Err(e) => {
+                bail!("camera open failed: {e}. Use --no-camera to run without a webcam.");
+            }
+        }
+    };
+
+    // --- Build the audio source (once, reused across reconnects) -
+    let audio_buf = if args.no_audio {
+        info!("audio: disabled (--no-audio)");
+        None
+    } else {
+        match audio::start_capture() {
+            Ok(handle) => {
+                info!("audio capture started");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(error = %e, "mic open failed, continuing without audio");
+                None
+            }
+        }
+    };
+
+    // --- iroh endpoint (once, reused across reconnects) ----------
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
-    let conn = endpoint.connect(ticket.leader, INGEST_ALPN).await?;
-    info!("connected");
-    let (mut send, mut recv) = conn.open_bi().await?;
+
+    // --- Graceful shutdown on ctrl-c -----------------------------
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("ctrl-c received, shutting down");
+        let _ = shutdown_tx.send(true);
+    });
+
+    // --- HLS recorder (optional) ---------------------------------
+    // Runs for the lifetime of the process (survives iroh reconnects).
+    let _recorder_task = if !args.no_record {
+        match recorder_rx {
+            Some(rx) => {
+                let cfg = RecorderConfig {
+                    camera_id: args.camera_id.clone(),
+                    recordings_dir: args.recordings_dir.clone(),
+                    fps: args.record_fps,
+                    segment_secs: args.record_segment_secs,
+                };
+                info!(
+                    camera = %cfg.camera_id,
+                    dir = %cfg.recordings_dir.display(),
+                    fps = cfg.fps,
+                    segment_secs = cfg.segment_secs,
+                    "HLS recorder: enabled"
+                );
+                Some(recorder::spawn(cfg, rx, shutdown_rx.clone()))
+            }
+            None => {
+                info!("HLS recorder: disabled (no camera)");
+                None
+            }
+        }
+    } else {
+        info!("HLS recorder: disabled (--no-record)");
+        None
+    };
+
+    // --- Reconnect loop ------------------------------------------
+    let mut attempt: u64 = 0;
+    let mut total_sent: u64 = 0;
+    loop {
+        if *shutdown_rx.borrow() {
+            info!("shutdown requested, stopping");
+            break;
+        }
+        attempt += 1;
+        if args.max_retries > 0 && attempt > args.max_retries {
+            warn!(attempts = attempt - 1, "max retries exceeded, giving up");
+            break;
+        }
+        if attempt > 1 {
+            let backoff = Duration::from_secs((attempt - 1).min(30));
+            info!(attempt, backoff_secs = backoff.as_secs(), "reconnecting");
+            let mut rx = shutdown_rx.clone();
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = wait_for_shutdown(&mut rx) => {
+                    info!("ctrl-c during backoff, stopping");
+                    break;
+                }
+            }
+        }
+
+        info!(leader = %ticket.leader.node_id, attempt, "dialing leader");
+        let mut rx = shutdown_rx.clone();
+        let conn = tokio::select! {
+            result = endpoint.connect(ticket.leader.clone(), INGEST_ALPN) => {
+                match result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "connect failed");
+                        continue;
+                    }
+                }
+            }
+            _ = wait_for_shutdown(&mut rx) => {
+                info!("ctrl-c during connect, stopping");
+                break;
+            }
+        };
+        info!("connected");
+
+        match run_session(
+            &conn,
+            &args,
+            &embedder,
+            &frames,
+            audio_buf.as_ref(),
+            &mut total_sent,
+            shutdown_rx.clone(),
+        )
+        .await
+        {
+            Ok(SessionEnd::Done) => break,
+            Ok(SessionEnd::CtrlC) => {
+                info!("ctrl-c, stopping");
+                break;
+            }
+            Ok(SessionEnd::Disconnected(reason)) => {
+                warn!(%reason, "session ended, will reconnect");
+            }
+            Err(e) => {
+                warn!(error = %e, "session error, will reconnect");
+            }
+        }
+    }
+
+    endpoint.close().await;
+    Ok(())
+}
+
+enum SessionEnd {
+    /// --count reached or clean Bye.
+    Done,
+    /// User pressed ctrl-c.
+    CtrlC,
+    /// Transport error; reconnect.
+    Disconnected(String),
+}
+
+/// One connection session. Returns when the session should end or when
+/// the transport breaks (caller decides whether to reconnect).
+async fn run_session(
+    conn: &iroh::endpoint::Connection,
+    args: &Args,
+    embedder: &Arc<dyn Embedder>,
+    frames: &FrameSource,
+    audio_buf: Option<&audio::AudioHandle>,
+    total_sent: &mut u64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<SessionEnd> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open bidi stream")?;
 
     // All outbound frames flow through this channel so the chunk loop and
     // the on-demand frame-request handler don't race for the send half.
@@ -130,32 +348,6 @@ async fn main() -> Result<()> {
         })
         .await
         .context("send hello")?;
-
-    // Ensure the frame directory exists before the first write.
-    std::fs::create_dir_all(&args.frame_dir)
-        .with_context(|| format!("create frame dir {}", args.frame_dir.display()))?;
-    info!(dir = %args.frame_dir.display(), "saving frames");
-
-    // --- Build the video embedder and frame buffer ------------------
-    let video_embedder = build_video_embedder(&args);
-    let frame_buffer = Arc::new(FrameBuffer::new(args.window_ms));
-
-    // --- Build the frame source ----------------------------------
-    let frames = if args.no_camera {
-        info!("frame source: solid placeholder");
-        FrameSource::Still(solid_placeholder())
-    } else {
-        match camera::spawn(args.device_index) {
-            Ok(handle) => {
-                info!(device = args.device_index, "webcam opened");
-                FrameSource::Cam(handle.rx)
-            }
-            Err(e) => {
-                warn!(error = %e, "camera open failed, using placeholder frame");
-                FrameSource::Still(solid_placeholder())
-            }
-        }
-    };
 
     // --- Reader task: drain LeaderMsg, serve FrameRequests --------
     let frames_for_reader = frames.clone();
@@ -209,77 +401,140 @@ async fn main() -> Result<()> {
         }
     });
 
-    // --- Feeder task: push frames into the FrameBuffer ---------------
-    {
-        let buf = frame_buffer.clone();
-        let frames_clone = frames.clone();
-        tokio::spawn(async move {
-            // For Still frames, just push once and be done.
-            // For Cam, continuously watch for updates.
-            match frames_clone {
-                FrameSource::Still(f) => {
-                    buf.push(now_ms(), f);
+    // --- Push loop: collect K frames over the chunk window, then embed --
+    let chunk_duration = Duration::from_millis(args.step_ms);
+    let k = args.frames_per_chunk.max(1);
+    let frame_interval = chunk_duration / k as u32;
+    let mut sent_this_session: u64 = 0;
+
+    let result = loop {
+        // Collect K evenly-spaced frames across the chunk window.
+        let chunk_start_ms = now_ms();
+        let mut sampled_frames: Vec<CapturedFrame> = Vec::with_capacity(k);
+        let mut frame_ticker = tokio::time::interval(frame_interval);
+        frame_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let mut aborted = false;
+        for _i in 0..k {
+            tokio::select! {
+                _ = frame_ticker.tick() => {
+                    if let Some(f) = frames.current() {
+                        sampled_frames.push(f);
+                    }
                 }
-                FrameSource::Cam(mut rx) => loop {
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                    if let Some(frame) = rx.borrow().clone() {
-                        buf.push(now_ms(), frame);
-                    }
-                },
-            }
-        });
-    }
-
-    // --- Push loop: emit embeddings on a sliding window schedule -----
-    let mut interval = tokio::time::interval(Duration::from_millis(args.step_ms));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut sent: u64 = 0;
-    let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let buf = frame_buffer.clone();
-                let emb = video_embedder.clone();
-                let out: VideoEmbeddingOutput = match emb.embed_window(&buf).await {
-                    Ok(o) => o,
-                    Err(e) => { warn!(error = %e, "embed_window failed, skipping chunk"); continue; }
-                };
-
-                let chunk = EmbeddingChunk {
-                    chunk_id: format!("{}-{}", args.camera_id, sent),
-                    camera_id: args.camera_id.clone(),
-                    start_ts_ms: out.start_ts_ms,
-                    end_ts_ms: out.end_ts_ms,
-                    embedding: out.embedding,
-                    caption: out.caption,
-                };
-                let dim = chunk.embedding.len();
-                if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
-                    warn!("writer channel closed; exiting");
+                _ = wait_for_shutdown(&mut shutdown_rx) => {
+                    aborted = true;
                     break;
                 }
-                sent += 1;
-                info!(sent, dim, "chunk sent");
-                if args.count != 0 && sent >= args.count {
-                    break;
-                }
-            }
-            _ = &mut stop => {
-                info!("ctrl-c, stopping");
-                break;
             }
         }
-    }
+        if aborted {
+            break SessionEnd::CtrlC;
+        }
+
+        if sampled_frames.is_empty() {
+            warn!("no frames captured this chunk, skipping");
+            continue;
+        }
+
+        // Extract middle frame JPEG before moving sampled_frames into input.
+        let representative_jpeg = {
+            sampled_frames
+                .get(sampled_frames.len() / 2)
+                .and_then(
+                    |mid_frame| match encode_jpeg_bytes(mid_frame, 60) {
+                        Ok(jpeg) => Some(jpeg),
+                        Err(e) => {
+                            warn!(error = %e, "failed to encode representative JPEG");
+                            None
+                        }
+                    },
+                )
+        };
+
+        // Drain the audio accumulated during this window.
+        let audio_samples = audio_buf.map(|h| h.buffer.drain()).unwrap_or_default();
+
+        // Capture end timestamp NOW, before the (potentially slow) embed
+        // call, so the chunk's time range reflects the actual capture
+        // window rather than being inflated by embedding latency.
+        let chunk_end_ms = now_ms();
+
+        let input = ChunkInput {
+            frames: sampled_frames.clone(),
+            audio_samples,
+        };
+
+        // Async embed — Gemini awaits HTTP directly; Cactus offloads to
+        // spawn_blocking internally; synthetic returns instantly.
+        let seq = *total_sent;
+        let embed_fut = embedder.embed_chunk(&input, seq);
+        tokio::pin!(embed_fut);
+
+        let out = tokio::select! {
+            res = &mut embed_fut => match res {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(error = %e, "embed failed, skipping chunk");
+                    continue;
+                }
+            },
+            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                break SessionEnd::CtrlC;
+            }
+        };
+
+        let ts = chunk_start_ms;
+        // Deterministic, stable id: restarting the follower must NOT
+        // double-ingest the same 5s window. `(camera_id, start_ts_ms)`
+        // uniquely identifies a chunk across restarts.
+        let chunk_id = format!("{}:{}", args.camera_id, ts);
+        let chunk = EmbeddingChunk {
+            chunk_id,
+            camera_id: args.camera_id.clone(),
+            start_ts_ms: ts,
+            end_ts_ms: chunk_end_ms,
+            embedding: out.embedding,
+            video_dim: out.video_dim,
+            audio_dim: out.audio_dim,
+            caption: out.caption,
+            representative_jpeg,
+        };
+        let dim = chunk.embedding.len();
+        let vd = chunk.video_dim;
+        let ad = chunk.audio_dim;
+        if writer_tx.send(FollowerMsg::Chunk(chunk)).await.is_err() {
+            break SessionEnd::Disconnected("writer channel closed".into());
+        }
+        *total_sent += 1;
+        sent_this_session += 1;
+        info!(
+            total = *total_sent,
+            session = sent_this_session,
+            dim,
+            video_dim = vd,
+            audio_dim = ad,
+            "chunk sent"
+        );
+        if args.count != 0 && *total_sent >= args.count {
+            break SessionEnd::Done;
+        }
+    };
 
     let _ = writer_tx.send(FollowerMsg::Bye).await;
     drop(writer_tx);
     let _ = writer_task.await;
     reader_task.abort();
-    endpoint.close().await;
-    Ok(())
+    Ok(result)
+}
+
+/// Resolves when the shutdown watch channel becomes `true`.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return; // sender dropped — treat as shutdown
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -289,17 +544,38 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_video_embedder(args: &Args) -> Arc<dyn VideoEmbedder> {
-    if args.synthetic {
-        info!("video embedder: synthetic (flag)");
-        return Arc::new(SyntheticVideoEmbedder::new(GEMINI_EMBED_DIM));
+async fn build_embedder(args: &Args) -> Result<Arc<dyn Embedder>> {
+    // 1) Try local Cactus/Gemma (on-device, no API key needed).
+    #[cfg(feature = "cactus")]
+    {
+        if args.model_path.exists() {
+            info!(path = %args.model_path.display(), "loading gemma-4 via cactus for embedding");
+            match CactusModel::new(&args.model_path) {
+                Ok(model) => {
+                    info!("embedder: CactusEmbedder (local gemma-4)");
+                    return Ok(Arc::new(CactusEmbedder::new(Arc::new(model))));
+                }
+                Err(e) => {
+                    warn!(error = %e, "cactus model load failed, trying gemini");
+                }
+            }
+        } else {
+            info!(path = %args.model_path.display(), "gemma weights not found, trying gemini");
+        }
     }
+
+    // 2) Gemini API.
     if let Some(ref key) = args.gemini_api_key {
-        info!("video embedder: GeminiVideoEmbedder (gemini-embedding-2-preview)");
-        return Arc::new(GeminiVideoEmbedder::new(key.clone()));
+        info!("embedder: GeminiEmbedder (gemini-embedding-2-preview)");
+        return Ok(Arc::new(GeminiEmbedder::new(key.clone())));
     }
-    info!("video embedder: synthetic (no GEMINI_API_KEY)");
-    Arc::new(SyntheticVideoEmbedder::new(GEMINI_EMBED_DIM))
+
+    // No embedding backend available — refuse to start.
+    bail!(
+        "no embedding backend available. Either:\n  \
+         1) Build with --features cactus and provide model weights at --model-path, or\n  \
+         2) Set GEMINI_API_KEY (or --gemini-api-key) for the Gemini API."
+    )
 }
 
 /// Encode an in-memory RGB frame to JPEG. Returns `(bytes, width, height)`.
@@ -325,23 +601,14 @@ fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<(Vec<u8>, u32, u32)
 #[derive(Clone)]
 enum FrameSource {
     Cam(tokio::sync::watch::Receiver<Option<CapturedFrame>>),
-    Still(CapturedFrame),
+    None,
 }
 
 impl FrameSource {
     fn current(&self) -> Option<CapturedFrame> {
         match self {
             FrameSource::Cam(rx) => rx.borrow().clone(),
-            FrameSource::Still(f) => Some(f.clone()),
+            FrameSource::None => None,
         }
-    }
-}
-
-/// 64x64 mid-gray RGB frame used when no camera is available.
-fn solid_placeholder() -> CapturedFrame {
-    CapturedFrame {
-        width: 64,
-        height: 64,
-        rgb: Arc::new(vec![128u8; 64 * 64 * 3]),
     }
 }
