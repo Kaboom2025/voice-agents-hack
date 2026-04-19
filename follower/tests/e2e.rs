@@ -105,6 +105,7 @@ async fn synthetic_follower_delivers_chunks_to_ingest_router() {
             video_dim: out.video_dim,
             audio_dim: out.audio_dim,
             caption: out.caption,
+            representative_jpeg: None,
         };
         write_frame(&mut send, &FollowerMsg::Chunk(chunk))
             .await

@@ -39,6 +39,8 @@ pub struct EmbeddingChunk {
     pub audio_dim: usize,
     /// Optional one-sentence caption for hybrid retrieval.
     pub caption: Option<String>,
+    /// Middle frame of the embedding window, JPEG-encoded at quality 60.
+    pub representative_jpeg: Option<Vec<u8>>,
 }
 
 /// Frames sent follower -> leader on `INGEST_ALPN`.
@@ -155,4 +157,27 @@ where
     r.read_exact(&mut buf).await?;
     let value = postcard::from_bytes(&buf).context("decode frame")?;
     Ok(Some(value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_chunk_round_trips_with_jpeg() {
+        let chunk = EmbeddingChunk {
+            chunk_id: "test-0".into(),
+            camera_id: "cam-0".into(),
+            start_ts_ms: 1000,
+            end_ts_ms: 6000,
+            embedding: vec![0.1, 0.2, 0.3],
+            video_dim: 3,
+            audio_dim: 0,
+            caption: Some("test".into()),
+            representative_jpeg: Some(vec![0xFF, 0xD8, 0xFF, 0xD9]),
+        };
+        let bytes = postcard::to_allocvec(&chunk).unwrap();
+        let decoded: EmbeddingChunk = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.representative_jpeg, Some(vec![0xFF, 0xD8, 0xFF, 0xD9]));
+    }
 }

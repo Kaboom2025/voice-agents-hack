@@ -18,14 +18,14 @@ use clap::Parser;
 use common::{
     read_frame, write_frame, EmbeddingChunk, FollowerMsg, LeaderMsg, Ticket, INGEST_ALPN,
 };
+use follower::audio;
 #[cfg(feature = "cactus")]
 use follower::cactus::CactusModel;
-use follower::audio;
 use follower::camera::{self, CapturedFrame};
 #[cfg(feature = "cactus")]
 use follower::embedder::CactusEmbedder;
 use follower::embedder::{ChunkInput, Embedder, SyntheticEmbedder, GEMMA4_HIDDEN_DIM};
-use follower::gemini_embedder::GeminiEmbedder;
+use follower::gemini_embedder::{GeminiEmbedder, GeminiVideoEmbedder};
 use iroh::Endpoint;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -352,13 +352,18 @@ async fn run_session(
             continue;
         }
 
+        // Extract middle frame JPEG before moving sampled_frames into input.
+        let representative_jpeg = {
+            sampled_frames
+                .get(sampled_frames.len() / 2)
+                .and_then(|mid_frame| GeminiVideoEmbedder::encode_jpeg_bytes(mid_frame, 60).ok())
+        };
+
         // Drain the audio accumulated during this window.
-        let audio_samples = audio_buf
-            .map(|h| h.buffer.drain())
-            .unwrap_or_default();
+        let audio_samples = audio_buf.map(|h| h.buffer.drain()).unwrap_or_default();
 
         let input = ChunkInput {
-            frames: sampled_frames,
+            frames: sampled_frames.clone(),
             audio_samples,
         };
 
@@ -391,6 +396,7 @@ async fn run_session(
             video_dim: out.video_dim,
             audio_dim: out.audio_dim,
             caption: out.caption,
+            representative_jpeg,
         };
         let dim = chunk.embedding.len();
         let vd = chunk.video_dim;
@@ -400,7 +406,14 @@ async fn run_session(
         }
         *total_sent += 1;
         sent_this_session += 1;
-        info!(total = *total_sent, session = sent_this_session, dim, video_dim = vd, audio_dim = ad, "chunk sent");
+        info!(
+            total = *total_sent,
+            session = sent_this_session,
+            dim,
+            video_dim = vd,
+            audio_dim = ad,
+            "chunk sent"
+        );
         if args.count != 0 && *total_sent >= args.count {
             break SessionEnd::Done;
         }
