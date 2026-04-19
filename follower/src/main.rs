@@ -63,6 +63,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_camera: bool,
 
+    /// Directory where captured JPEG frames are written (one file per
+    /// chunk, named `<camera-id>-<seq>.jpg`). Created if missing.
+    #[arg(long, env = "FOLLOWER_FRAME_DIR", default_value = "./frames")]
+    frame_dir: PathBuf,
+
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log: String,
 }
@@ -117,6 +122,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Ensure the frame directory exists before the first write.
+    std::fs::create_dir_all(&args.frame_dir)
+        .with_context(|| format!("create frame dir {}", args.frame_dir.display()))?;
+    info!(dir = %args.frame_dir.display(), "saving frames");
+
     // --- Build the embedder --------------------------------------
     let embedder: Arc<dyn Embedder> = if args.synthetic {
         info!("embedder: synthetic (flag)");
@@ -130,7 +140,11 @@ async fn main() -> Result<()> {
         match model {
             Ok(m) => {
                 info!(path = %args.model_path.display(), "cactus gemma-4 loaded");
-                Arc::new(CactusEmbedder::new(Arc::new(m)))
+                Arc::new(
+                    CactusEmbedder::new(Arc::new(m))
+                        .with_tmp_dir(args.frame_dir.clone())
+                        .with_file_prefix(args.camera_id.clone()),
+                )
             }
             Err(e) => {
                 warn!(error = %e, "cactus init failed, falling back to synthetic");

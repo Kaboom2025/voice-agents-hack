@@ -35,6 +35,7 @@ pub struct EmbeddingOutput {
 pub struct CactusEmbedder {
     model: Arc<CactusModel>,
     tmp_dir: std::path::PathBuf,
+    file_prefix: String,
     jpeg_quality: u8,
 }
 
@@ -45,12 +46,22 @@ impl CactusEmbedder {
         Self {
             model,
             tmp_dir: std::env::temp_dir(),
+            file_prefix: "follower-frame".to_string(),
             jpeg_quality: 85,
         }
     }
 
     pub fn with_tmp_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.tmp_dir = dir.into();
+        self
+    }
+
+    /// Use `prefix` (e.g. the camera id) as the JPEG filename stem,
+    /// combined with the chunk sequence to produce unique per-frame
+    /// filenames. When set, every captured frame is persisted rather
+    /// than rotated.
+    pub fn with_file_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.file_prefix = prefix.into();
         self
     }
 
@@ -80,9 +91,11 @@ impl Embedder for CactusEmbedder {
     }
 
     fn embed_frame(&self, frame: &CapturedFrame, seq: u64) -> Result<EmbeddingOutput> {
-        // Rotating two paths so we don't blow out tmpfs with long runs.
-        let slot = seq % 2;
-        let path = self.tmp_dir.join(format!("follower-frame-{slot}.jpg"));
+        // One file per chunk — callers that care about disk pressure can
+        // point `with_tmp_dir` at a scratch location and prune externally.
+        let path = self
+            .tmp_dir
+            .join(format!("{}-{seq:06}.jpg", self.file_prefix));
         self.write_jpeg(frame, &path)?;
 
         let raw = self
