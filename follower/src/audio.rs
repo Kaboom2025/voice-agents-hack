@@ -186,7 +186,7 @@ fn resample_if_needed(data: &[f32], source_rate: u32) -> Vec<f32> {
 
 /// Encode mono f32 audio samples to a 16-bit PCM WAV buffer in memory.
 /// Returns the complete WAV file as bytes (with RIFF header, fmt chunk, data chunk).
-pub fn encode_wav_bytes(samples: &[f32]) -> Vec<u8> {
+pub fn encode_wav_bytes(samples: &[f32]) -> Result<Vec<u8>> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: SAMPLE_RATE,
@@ -196,15 +196,17 @@ pub fn encode_wav_bytes(samples: &[f32]) -> Vec<u8> {
     let capacity = 44 + samples.len() * 2;
     let buf = Vec::with_capacity(capacity);
     let mut cursor = Cursor::new(buf);
-    let mut writer =
-        hound::WavWriter::new(&mut cursor, spec).expect("failed to create in-memory WAV writer");
+    let mut writer = hound::WavWriter::new(&mut cursor, spec)
+        .context("failed to create in-memory WAV writer")?;
     for &s in samples {
         let clamped = s.clamp(-1.0, 1.0);
         let sample = (clamped * i16::MAX as f32) as i16;
-        let _ = writer.write_sample(sample);
+        writer.write_sample(sample)?;
     }
-    let _ = writer.finalize();
-    cursor.into_inner()
+    writer
+        .finalize()
+        .context("failed to finalize in-memory WAV writer")?;
+    Ok(cursor.into_inner())
 }
 
 /// Write a mono f32 audio buffer to a 16-bit PCM WAV file at
@@ -237,7 +239,7 @@ mod tests {
     #[test]
     fn encode_wav_bytes_has_riff_header() {
         let samples = vec![0.0; 100];
-        let buf = encode_wav_bytes(&samples);
+        let buf = encode_wav_bytes(&samples).unwrap();
         assert!(buf.starts_with(b"RIFF"));
         assert!(buf.len() >= 44);
     }
@@ -245,14 +247,14 @@ mod tests {
     #[test]
     fn encode_wav_bytes_has_wave_marker() {
         let samples = vec![0.0; 100];
-        let buf = encode_wav_bytes(&samples);
+        let buf = encode_wav_bytes(&samples).unwrap();
         assert_eq!(&buf[8..12], b"WAVE");
     }
 
     #[test]
     fn encode_wav_bytes_length_matches_samples() {
         let samples = vec![0.5; 1000];
-        let buf = encode_wav_bytes(&samples);
+        let buf = encode_wav_bytes(&samples).unwrap();
         // RIFF header (44 bytes) + 2 bytes per i16 sample
         assert_eq!(buf.len(), 44 + samples.len() * 2);
     }

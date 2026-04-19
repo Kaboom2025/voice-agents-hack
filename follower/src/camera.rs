@@ -13,7 +13,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nokhwa::{
     pixel_format::RgbFormat,
-    utils::{CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
+    utils::{
+        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
+    },
     Camera,
 };
 use tokio::sync::watch;

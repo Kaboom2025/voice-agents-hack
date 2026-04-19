@@ -74,7 +74,7 @@ impl crate::embedder::Embedder for GeminiEmbedder {
 
                 // Add audio as WAV if samples present
                 if !audio_samples.is_empty() {
-                    let wav_bytes = audio::encode_wav_bytes(&audio_samples);
+                    let wav_bytes = audio::encode_wav_bytes(&audio_samples)?;
                     let wav_b64 = B64.encode(&wav_bytes);
                     parts.push(MediaPart {
                         mime_type: "audio/wav".to_string(),

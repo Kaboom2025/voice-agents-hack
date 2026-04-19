@@ -168,8 +168,7 @@ impl CactusEmbedder {
             .model
             .embed_audio(&wav_path)
             .context("cactus audio embed")?;
-        let pooled =
-            mean_pool(&raw, GEMMA4_HIDDEN_DIM).context("mean pool audio embedding")?;
+        let pooled = mean_pool(&raw, GEMMA4_HIDDEN_DIM).context("mean pool audio embedding")?;
         Ok(pooled)
     }
 }
@@ -198,9 +197,7 @@ impl CactusEmbedder {
         } else {
             0.0
         };
-        let caption = Some(format!(
-            "gemma-4 chunk: {k} frames, {audio_secs:.1}s audio"
-        ));
+        let caption = Some(format!("gemma-4 chunk: {k} frames, {audio_secs:.1}s audio"));
 
         Ok(EmbeddingOutput {
             embedding,
@@ -223,7 +220,10 @@ impl Embedder for CactusEmbedder {
         let frames = input.frames.clone();
         let audio_samples = input.audio_samples.clone();
         tokio::task::spawn_blocking(move || {
-            let input = ChunkInput { frames, audio_samples };
+            let input = ChunkInput {
+                frames,
+                audio_samples,
+            };
             this.embed_chunk_blocking(&input, seq)
         })
         .await
