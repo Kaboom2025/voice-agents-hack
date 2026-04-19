@@ -4,9 +4,9 @@
 //! camera plus the audio segment from the microphone. The embedder
 //! produces a `[video_emb || audio_emb]` vector per chunk.
 //!
-//! Embeds video windows (sliding frames) using GeminiVideoEmbedder.
-//! Requires either a Cactus/Gemma model or a Gemini API key — will
-//! not start without a real embedding backend.
+//! Embeds video windows (sliding frames) using `GeminiEmbedder` or
+//! `CactusEmbedder`. Requires either a Cactus/Gemma model or a Gemini
+//! API key — will not start without a real embedding backend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use follower::camera::{self, CapturedFrame};
 #[cfg(feature = "cactus")]
 use follower::embedder::CactusEmbedder;
 use follower::embedder::{ChunkInput, Embedder};
-use follower::gemini_embedder::{GeminiEmbedder, GeminiVideoEmbedder};
+use follower::gemini_embedder::{encode_jpeg_bytes, GeminiEmbedder};
 use iroh::Endpoint;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -51,16 +51,18 @@ struct Args {
     #[arg(long, default_value_t = 10_000)]
     window_ms: u64,
 
-    /// Gemini API key. If set, uses GeminiVideoEmbedder. Required when
-    /// Cactus model is not available.
+    /// Gemini API key. If set, uses `GeminiEmbedder` (cloud multimodal
+    /// embedding). Required when Cactus model is not available.
     #[arg(long, env = "GEMINI_API_KEY")]
     gemini_api_key: Option<String>,
 
     /// Path to the Cactus-converted Gemma weights directory. Used when
-    /// built with `--features cactus` for on-device embedding.
+    /// built with `--features cactus` for on-device embedding. Prefer
+    /// setting `CACTUS_MODEL_PATH` in your environment to keep this
+    /// machine-specific path out of CLI scripts.
     #[arg(
         long,
-        env = "GEMMA_MODEL_PATH",
+        env = "CACTUS_MODEL_PATH",
         default_value = "weights/gemma-4-e2b-it"
     )]
     model_path: PathBuf,
@@ -390,7 +392,7 @@ async fn run_session(
             sampled_frames
                 .get(sampled_frames.len() / 2)
                 .and_then(
-                    |mid_frame| match GeminiVideoEmbedder::encode_jpeg_bytes(mid_frame, 60) {
+                    |mid_frame| match encode_jpeg_bytes(mid_frame, 60) {
                         Ok(jpeg) => Some(jpeg),
                         Err(e) => {
                             warn!(error = %e, "failed to encode representative JPEG");
@@ -433,8 +435,12 @@ async fn run_session(
         };
 
         let ts = chunk_start_ms;
+        // Deterministic, stable id: restarting the follower must NOT
+        // double-ingest the same 5s window. `(camera_id, start_ts_ms)`
+        // uniquely identifies a chunk across restarts.
+        let chunk_id = format!("{}:{}", args.camera_id, ts);
         let chunk = EmbeddingChunk {
-            chunk_id: format!("{}-{}", args.camera_id, *total_sent),
+            chunk_id,
             camera_id: args.camera_id.clone(),
             start_ts_ms: ts,
             end_ts_ms: chunk_end_ms,

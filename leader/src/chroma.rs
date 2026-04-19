@@ -31,7 +31,10 @@ impl ChromaCollections {
     /// Connect to ChromaDB and create/get the per-modality collections.
     pub async fn connect(base_url: &str) -> Result<Self> {
         // Verify server is reachable.
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client build with static timeout is infallible");
         let hb_url = format!("{base_url}/api/v2/heartbeat");
         let hb = http
             .get(&hb_url)
@@ -121,7 +124,10 @@ impl ChromaClient {
     /// with cosine distance. Does NOT check heartbeat — caller should
     /// use `ChromaCollections::connect()` which does.
     async fn connect_collection(base_url: &str, collection_name: &str) -> Result<Self> {
-        let http = reqwest::Client::new();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client build with static timeout is infallible");
         let url = format!("{base_url}/{V2_PREFIX}/collections");
 
         let body = CreateCollectionReq {

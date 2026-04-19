@@ -85,11 +85,13 @@ struct Args {
 
     /// Path to the Cactus-converted Gemma weights directory. When the
     /// `cactus` feature is on, this model is loaded at startup and used
-    /// to answer `POST /api/query`. Ignored without the feature.
+    /// to answer `POST /api/query`. Ignored without the feature. No
+    /// built-in default — set `CACTUS_MODEL_PATH` (or `GEMMA_MODEL_PATH`)
+    /// in your environment, or pass `--model-path`.
     #[arg(
         long,
-        env = "GEMMA_MODEL_PATH",
-        default_value = "/Users/danielargento/cactus/weights/gemma-4-e2b-it"
+        env = "CACTUS_MODEL_PATH",
+        default_value = "weights/gemma-4-e2b-it"
     )]
     model_path: PathBuf,
 
@@ -757,20 +759,25 @@ async fn retrieve(state: &AppState, req: &QueryReq) -> Result<Vec<store::ScoredC
     // Priority: 1) local Cactus/Gemma  2) Gemini API
     let query_embedding = embed_query(state, &req.query).await?;
 
-    // Determine search modality from the request.
+    // Determine search modality from the request. When the UI sends
+    // `["video","audio"]` (or an explicit "all", or an empty/missing
+    // field), default to `All` so both Chroma collections get queried
+    // and results are RRF-merged. Only collapse to a single modality
+    // when the user unambiguously asked for one.
     let modality = match &req.modalities {
-        Some(mods) => {
-            let has_video = mods.iter().any(|m| m == "video");
-            let has_audio = mods.iter().any(|m| m == "audio");
-            match (has_video, has_audio) {
-                (true, false) => SearchModality::Video,
-                (false, true) => SearchModality::Audio,
-                _ => SearchModality::Video, // default: text queries match video
+        Some(mods) if !mods.is_empty() => {
+            let has_video = mods.iter().any(|m| m.eq_ignore_ascii_case("video"));
+            let has_audio = mods.iter().any(|m| m.eq_ignore_ascii_case("audio"));
+            let has_all = mods.iter().any(|m| m.eq_ignore_ascii_case("all"));
+            match (has_all, has_video, has_audio) {
+                (true, _, _) => SearchModality::All,
+                (_, true, false) => SearchModality::Video,
+                (_, false, true) => SearchModality::Audio,
+                _ => SearchModality::All,
             }
         }
-        // Text queries are most semantically related to visual content,
-        // so default to video-only matching.
-        None => SearchModality::Video,
+        // No modality filter from caller → search everything.
+        _ => SearchModality::All,
     };
 
     let filter = QueryFilter {

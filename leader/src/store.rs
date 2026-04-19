@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use anyhow::{Context, Result};
 use common::EmbeddingChunk;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::chroma::ChromaCollections;
 
@@ -40,7 +40,7 @@ pub enum SearchModality {
 
 impl Default for SearchModality {
     fn default() -> Self {
-        Self::Video
+        Self::All
     }
 }
 
@@ -165,6 +165,17 @@ impl EmbeddingStore {
     }
 
     pub fn push(&self, chunk: EmbeddingChunk) {
+        // P1-6: chunk_id is now follower-side deterministic
+        // (`<camera_id>:<start_ts_ms>`). If we already have this id a
+        // restart is replaying the append log — skip silently rather
+        // than double-counting.
+        {
+            let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
+            if idx.contains_key(&chunk.chunk_id) {
+                return;
+            }
+        }
+
         // Write thumbnail to disk (if present).
         let has_thumbnail = if let (Some(dir), Some(ref jpeg)) = (&self.dir, &chunk.representative_jpeg) {
             let thumb_path = dir.join("thumbnails").join(format!("{}.jpg", chunk.chunk_id));
@@ -290,11 +301,12 @@ impl EmbeddingStore {
         let audio_result = if matches!(filter.modality, SearchModality::All | SearchModality::Audio) {
             if let Some(ref audio_client) = collections.audio {
                 // Audio query only works if query dim matches audio dim.
-                // For text queries this may not match — skip gracefully.
+                // For text queries this often won't match; we surface that
+                // loudly so the UI can tell the user audio is unavailable.
                 match audio_client.query(query_vec, filter.top_k * 2, where_filter).await {
                     Ok(r) => Some(r),
                     Err(e) => {
-                        debug!(%e, "audio collection query failed (dimension mismatch?), skipping");
+                        warn_audio_query_failed_once(query_vec.len(), &e);
                         None
                     }
                 }
@@ -332,6 +344,7 @@ impl EmbeddingStore {
         let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
 
         let mut scored: Vec<ScoredChunk> = Vec::with_capacity(rrf_scores.len());
+        let rrf_weight = rrf_weight();
         for (chunk_id, rrf_score) in &rrf_scores {
             if let Some(&pos) = idx.get(chunk_id) {
                 if let Some(sc) = chunks.get(pos) {
@@ -347,9 +360,11 @@ impl EmbeddingStore {
                     let caption = filter.caption_query.as_ref()
                         .map(|cq| caption_boost(&sc.chunk.caption, cq))
                         .unwrap_or(0.0);
-                    // Combine: cosine dominates, RRF adds up to ~0.03 for
-                    // chunks that appear in multiple collections.
-                    let score = cosine + rrf_score * 2.0 + caption;
+                    // Combine: cosine dominates, RRF adds up to
+                    // ~rrf_weight·0.016 for chunks that appear in
+                    // multiple collections. Both weights are tunable via
+                    // LEADER_RRF_WEIGHT / LEADER_CAPTION_BOOST.
+                    let score = cosine + rrf_score * rrf_weight + caption;
                     scored.push(ScoredChunk { chunk: sc.clone(), score });
                 }
             }
@@ -563,7 +578,10 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// Modality-aware similarity: extracts the relevant portion of the stored
 /// embedding (video-only, audio-only, or full) and compares against the
-/// query vector. Handles dimension mismatches gracefully.
+/// query vector. Returns `0.0` on a genuine dimension mismatch — silently
+/// truncating to a common prefix produces meaningless scores, so we'd
+/// rather miss the hit loudly than rank garbage. Each unique
+/// `(query_dim, target_dim)` mismatch is warned about exactly once.
 fn modality_aware_similarity(
     query: &[f32],
     stored: &[f32],
@@ -590,29 +608,59 @@ fn modality_aware_similarity(
         SearchModality::All => stored,
     };
 
-    // If query and target are the same length, compare directly.
     if query.len() == target_slice.len() {
         return cosine_similarity(query, target_slice);
     }
 
-    // If query is shorter than target, use the min-length prefix.
-    // This handles e.g. 1536-d text query vs 1536-d video portion.
-    let min_len = query.len().min(target_slice.len());
-    if min_len == 0 {
-        return 0.0;
+    warn_dim_mismatch_once(query.len(), target_slice.len(), modality);
+    0.0
+}
+
+/// Tracks `(query_dim, target_dim, modality)` pairs we've already warned
+/// about so log volume stays bounded when every stored chunk triggers the
+/// same mismatch.
+fn warn_dim_mismatch_once(query_dim: usize, target_dim: usize, modality: SearchModality) {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(usize, usize, &'static str)>>> =
+        OnceLock::new();
+    let mod_label: &'static str = match modality {
+        SearchModality::All => "all",
+        SearchModality::Video => "video",
+        SearchModality::Audio => "audio",
+    };
+    let set = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert((query_dim, target_dim, mod_label)) {
+        warn!(
+            query_dim,
+            target_dim,
+            modality = mod_label,
+            "dimension mismatch — similarity set to 0.0. Check that the \
+             query backend matches the backend that produced stored chunks."
+        );
     }
-    debug!(
-        query_dim = query.len(),
-        target_dim = target_slice.len(),
-        using_dim = min_len,
-        "dimension mismatch — comparing common prefix"
-    );
-    cosine_similarity(&query[..min_len], &target_slice[..min_len])
+}
+
+/// Warn once per unique query dim about the audio Chroma collection
+/// failing. The most common cause is a text query whose dim does not
+/// match the audio collection's stored dim.
+fn warn_audio_query_failed_once(query_dim: usize, err: &anyhow::Error) {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+    let set = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.insert(query_dim) {
+        warn!(
+            query_dim,
+            error = %err,
+            "audio-clips Chroma query failed — audio modality unavailable for \
+             this query (most likely a dim mismatch)."
+        );
+    }
 }
 
 /// Compute a caption-text relevance boost via simple keyword overlap.
-/// Returns a small additive score (0.0–0.15) so dense similarity still
-/// dominates but keyword matches break ties and surface relevant captions.
+/// Returns a small additive score (0.0–`LEADER_CAPTION_BOOST`) so dense
+/// similarity still dominates but keyword matches break ties. The cap is
+/// configurable via the `LEADER_CAPTION_BOOST` env var (default `0.15`).
 fn caption_boost(caption: &Option<String>, query: &str) -> f32 {
     let caption = match caption {
         Some(c) if !c.is_empty() => c.to_lowercase(),
@@ -631,8 +679,34 @@ fn caption_boost(caption: &Option<String>, query: &str) -> f32 {
         .filter(|w| caption.contains(**w))
         .count();
     let ratio = matches as f32 / query_words.len() as f32;
-    // Cap at 0.15 so it's a tiebreaker, not a dominator.
-    (ratio * 0.15).min(0.15)
+    let cap = caption_boost_cap();
+    (ratio * cap).min(cap)
+}
+
+/// RRF mixing weight (`score = cosine + rrf * W + caption`). Defaults to
+/// `2.0`; override via `LEADER_RRF_WEIGHT`.
+fn rrf_weight() -> f32 {
+    static CACHED: OnceLock<f32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LEADER_RRF_WEIGHT")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(2.0)
+    })
+}
+
+/// Max additive caption-boost score. Defaults to `0.15`; override via
+/// `LEADER_CAPTION_BOOST`.
+fn caption_boost_cap() -> f32 {
+    static CACHED: OnceLock<f32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LEADER_CAPTION_BOOST")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.15)
+    })
 }
 
 #[cfg(test)]

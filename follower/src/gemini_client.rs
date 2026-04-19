@@ -53,7 +53,12 @@ impl GeminiEmbedClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
-            http: reqwest::Client::new(),
+            // Cap each Gemini call at 30s so a wedged endpoint can't
+            // stall the whole follower ingest loop indefinitely.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client build with static timeout is infallible"),
         }
     }
 

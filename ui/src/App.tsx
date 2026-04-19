@@ -11,6 +11,9 @@ import { CameraScope, scopeToIds, type Scope } from "./components/CameraScope";
 import { LiveGrid } from "./components/LiveGrid";
 import { VoiceBar } from "./components/VoiceBar";
 import { ResultCard } from "./components/ResultCard";
+import { ImageSearch } from "./tabs/ImageSearch";
+
+type View = "ask" | "image-search";
 
 function hitsGridCols(n: number): string {
   if (n <= 1) return "grid-cols-1";
@@ -22,6 +25,7 @@ function hitsGridCols(n: number): string {
 export default function App() {
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [last, setLast] = useState<{ question: string; answer: QueryResponse } | null>(null);
+  const [view, setView] = useState<View>("ask");
 
   const { data: cameras = [] } = useQuery({ queryKey: ["cameras"], queryFn: api.listCameras });
   const ids = scopeToIds(scope, cameras);
@@ -48,11 +52,34 @@ export default function App() {
           <span className="size-2 rounded-full bg-accent" />
           <span className="font-mono text-xs tracking-[0.2em] text-mute uppercase">multicam</span>
         </div>
+        <nav className="flex items-center gap-1 p-1 rounded-full bg-slate-100 border border-slate-200">
+          <button
+            onClick={() => setView("ask")}
+            className={`px-3 py-1 rounded-full text-[11px] font-mono uppercase tracking-wider transition-colors ${
+              view === "ask" ? "bg-ink text-white" : "text-mute hover:text-ink"
+            }`}
+          >
+            Ask
+          </button>
+          <button
+            onClick={() => setView("image-search")}
+            className={`px-3 py-1 rounded-full text-[11px] font-mono uppercase tracking-wider transition-colors ${
+              view === "image-search" ? "bg-ink text-white" : "text-mute hover:text-ink"
+            }`}
+          >
+            Image Search
+          </button>
+        </nav>
         <div className="text-[11px] font-mono text-mute">
           {ids.length} stream{ids.length === 1 ? "" : "s"}
         </div>
       </header>
 
+      {view === "image-search" ? (
+        <main className="flex-1 px-6 pb-6 max-w-7xl w-full mx-auto">
+          <ImageSearch />
+        </main>
+      ) : (
       <main className="flex-1 px-6 pb-6 space-y-6 max-w-7xl w-full mx-auto">
         {/* Live camera feeds */}
         <section className="space-y-3">
@@ -142,6 +169,7 @@ export default function App() {
           </section>
         )}
       </main>
+      )}
     </div>
   );
 }

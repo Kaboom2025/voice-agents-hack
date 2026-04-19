@@ -28,6 +28,10 @@ const EMBED_BUF_LEN: usize = 1024 * 1024;
 
 const EMBED_BUF_BYTES: usize = EMBED_BUF_LEN * std::mem::size_of::<f32>();
 
+/// 64 KiB is plenty for a per-chunk caption (Gemma emits ≤80 tokens with
+/// our prompt, ~400 bytes worst case). Matches the leader's buffer.
+const RESPONSE_BUF_BYTES: usize = 64 * 1024;
+
 /// An initialized Cactus model.
 ///
 /// Internally holds the raw handle and serializes every FFI call to the
@@ -184,6 +188,57 @@ impl CactusModel {
         buf.truncate(dim);
         Ok(buf)
     }
+
+    /// Run a chat completion. `messages_json` is a JSON array of
+    /// `{"role":..., "content":..., "images": [...]}` entries. Returns
+    /// the raw NUL-terminated JSON response Cactus emits (contains
+    /// `response`, timing stats, etc). Used by the follower to produce
+    /// per-chunk captions that are then text-embedded into the shared
+    /// text-encoder cosine space.
+    pub fn complete(&self, messages_json: &str, options_json: Option<&str>) -> Result<String> {
+        use std::os::raw::c_char;
+        use std::ptr;
+
+        let msgs_c = CString::new(messages_json).context("messages contain NUL byte")?;
+        let opts_c = options_json
+            .map(CString::new)
+            .transpose()
+            .context("options contain NUL byte")?;
+        let opts_ptr = opts_c.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+
+        let mut buf = vec![0 as c_char; RESPONSE_BUF_BYTES];
+
+        let rc = {
+            let guard = self.inner.lock().unwrap();
+            // SAFETY: mutex-held, handle non-null, buf is valid for
+            // the duration of the call.
+            unsafe {
+                ffi::cactus_complete(
+                    guard.0,
+                    msgs_c.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    opts_ptr,
+                    ptr::null(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                )
+            }
+        };
+
+        if rc < 0 {
+            return Err(anyhow!(
+                "cactus_complete rc={rc}: {}",
+                last_error().unwrap_or_else(|| "<no error message>".into())
+            ));
+        }
+
+        // Buffer is NUL-terminated by Cactus.
+        let response = unsafe { CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned() };
+        Ok(response)
+    }
 }
 
 fn last_error() -> Option<String> {
@@ -197,6 +252,50 @@ fn last_error() -> Option<String> {
             Some(CStr::from_ptr(p).to_string_lossy().into_owned())
         }
     }
+}
+
+/// Extract the final answer text from a raw `cactus_complete` JSON
+/// response. Unwraps the `{"response":"..."}` envelope (when present)
+/// and strips Harmony-style `<|channel|>analysis<|message|>...` preambles
+/// so the caller only sees the assistant's final message. Mirrors the
+/// leader's `extract_response`+`strip_thinking` pair to keep the two
+/// crates from drifting.
+pub fn extract_final_text(raw: &str) -> String {
+    let body = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v["response"].as_str().map(String::from))
+        .unwrap_or_else(|| raw.to_string());
+    strip_thinking(&body).to_string()
+}
+
+fn strip_thinking(text: &str) -> &str {
+    let body: &str = if let Some(start) = text.rfind("<|channel|>final<|message|>") {
+        &text[start + "<|channel|>final<|message|>".len()..]
+    } else if let Some(start) = text.rfind("<|message|>") {
+        &text[start + "<|message|>".len()..]
+    } else if let Some(idx) = text.rfind("<|channel|>") {
+        let rest = &text[idx..];
+        match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        }
+    } else if let Some(idx) = text.rfind("<|channel>") {
+        let rest = &text[idx..];
+        match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        }
+    } else {
+        text
+    };
+
+    let mut out = body.trim_start();
+    for marker in ["<|end|>", "<|return|>", "<|endoftext|>"] {
+        if let Some(i) = out.find(marker) {
+            out = &out[..i];
+        }
+    }
+    out.trim()
 }
 
 /// Mean-pool a flat `[N * D]` vector to `[D]` by averaging over N.
@@ -230,14 +329,26 @@ pub fn mean_pool(flat: &[f32], hidden_dim: usize) -> Result<Vec<f32>> {
     Ok(pooled)
 }
 
-/// L2-normalize in place. Zero-norm vectors are left alone.
-pub fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
+/// L2-normalize in place. Returns `true` when the vector was normalized,
+/// `false` when it was left unchanged because the norm was zero or a
+/// non-finite value appeared (NaN, ±inf). Silent-room audio frequently
+/// yields an all-zero embedding; leaving that vector in-place (rather
+/// than letting `0/0 = NaN` poison every downstream cosine) is the safe
+/// thing to do.
+pub fn l2_normalize(v: &mut [f32]) -> bool {
+    // Reject anything non-finite up front — a single NaN from a buggy
+    // upstream would otherwise propagate silently through cosine.
+    if !v.iter().all(|x| x.is_finite()) {
+        return false;
     }
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if !(norm > 0.0 && norm.is_finite()) {
+        return false;
+    }
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -247,7 +358,7 @@ mod tests {
     #[test]
     fn l2_normalize_makes_unit_vector() {
         let mut v = vec![3.0, 4.0];
-        l2_normalize(&mut v);
+        assert!(l2_normalize(&mut v));
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
     }
@@ -255,8 +366,22 @@ mod tests {
     #[test]
     fn l2_normalize_ignores_zero_vector() {
         let mut v = vec![0.0, 0.0, 0.0];
-        l2_normalize(&mut v);
+        assert!(!l2_normalize(&mut v));
         assert_eq!(v, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn l2_normalize_rejects_nan() {
+        let mut v = vec![1.0, f32::NAN, 2.0];
+        assert!(!l2_normalize(&mut v));
+        // Input untouched on rejection.
+        assert!(v[1].is_nan());
+    }
+
+    #[test]
+    fn l2_normalize_rejects_infinity() {
+        let mut v = vec![1.0, f32::INFINITY];
+        assert!(!l2_normalize(&mut v));
     }
 
     #[test]
@@ -271,5 +396,22 @@ mod tests {
     fn mean_pool_rejects_mismatched_dim() {
         let flat = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         assert!(mean_pool(&flat, 3).is_err());
+    }
+
+    #[test]
+    fn extract_final_text_unwraps_harmony_preamble() {
+        let raw = r#"{"response":"<|channel|>analysis<|message|>thinking...<|end|><|start|>assistant<|channel|>final<|message|>A cat on a sofa.<|return|>"}"#;
+        assert_eq!(extract_final_text(raw), "A cat on a sofa.");
+    }
+
+    #[test]
+    fn extract_final_text_falls_back_to_plain_response() {
+        let raw = r#"{"response":"Just a plain caption."}"#;
+        assert_eq!(extract_final_text(raw), "Just a plain caption.");
+    }
+
+    #[test]
+    fn extract_final_text_handles_non_json_input() {
+        assert_eq!(extract_final_text("raw string"), "raw string");
     }
 }

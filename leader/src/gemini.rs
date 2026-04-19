@@ -45,7 +45,12 @@ impl GeminiEmbedClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
-            http: reqwest::Client::new(),
+            // 30s timeout — a stuck Gemini call must not wedge query
+            // latency.
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client build with static timeout is infallible"),
         }
     }
 
@@ -88,12 +93,18 @@ impl GeminiEmbedClient {
 
         let mut values = parsed.embedding.values;
         // L2-normalize so it's consistent with the normalized chunk
-        // embeddings stored by followers.
+        // embeddings stored by followers. Bail on zero-norm / non-finite
+        // vectors rather than silently producing NaNs that would poison
+        // every downstream cosine similarity.
+        if !values.iter().all(|x| x.is_finite()) {
+            anyhow::bail!("gemini embed returned non-finite values");
+        }
         let norm: f32 = values.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for x in values.iter_mut() {
-                *x /= norm;
-            }
+        if !(norm > 0.0 && norm.is_finite()) {
+            anyhow::bail!("gemini embed returned zero-norm vector");
+        }
+        for x in values.iter_mut() {
+            *x /= norm;
         }
         Ok(values)
     }

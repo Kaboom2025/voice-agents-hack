@@ -18,7 +18,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 #[cfg(feature = "cactus")]
-use crate::cactus::{l2_normalize, mean_pool, CactusModel};
+use crate::cactus::{extract_final_text, l2_normalize, CactusModel};
 use crate::camera::CapturedFrame;
 
 /// Gemma-4-E2B hidden dimension — target for mean-pooled image embeddings.
@@ -110,87 +110,95 @@ impl CactusEmbedder {
         Ok(())
     }
 
-    /// Embed K frames: embed each independently, then mean-pool across
-    /// all K per-frame embeddings to get a single video vector.
-    fn embed_frames(&self, frames: &[CapturedFrame], seq: u64) -> Result<Vec<f32>> {
-        let mut per_frame_pooled: Vec<Vec<f32>> = Vec::with_capacity(frames.len());
-        for (i, frame) in frames.iter().enumerate() {
-            let path = self
-                .tmp_dir
-                .join(format!("{}-{seq:06}-f{i}.jpg", self.file_prefix));
-            self.write_jpeg(frame, &path)?;
-            let raw = self
-                .model
-                .embed_image(&path)
-                .with_context(|| format!("cactus image embed frame {i}"))?;
-            let pooled = mean_pool(&raw, GEMMA4_HIDDEN_DIM)
-                .context("mean pool per-frame image embedding")?;
-            per_frame_pooled.push(pooled);
-        }
-        // Mean-pool across K frames → single [GEMMA4_HIDDEN_DIM] video vec.
-        let k = per_frame_pooled.len();
-        let mut video_emb = vec![0f32; GEMMA4_HIDDEN_DIM];
-        for p in &per_frame_pooled {
-            for (v, x) in video_emb.iter_mut().zip(p.iter()) {
-                *v += *x;
-            }
-        }
-        let inv = 1.0 / k as f32;
-        for v in &mut video_emb {
-            *v *= inv;
-        }
-        Ok(video_emb)
-    }
-
-    /// Embed the audio segment. Returns an empty vec if no audio.
-    fn embed_audio(&self, samples: &[f32], seq: u64) -> Result<Vec<f32>> {
-        if samples.is_empty() {
-            return Ok(Vec::new());
-        }
-        let wav_path = self
+    /// Caption the representative frame via Gemma-4 vision, then embed
+    /// the caption with the text encoder. This is the **only** vector we
+    /// ship — pooled vision-tower / audio-encoder states are not in the
+    /// same cosine space as the text encoder, so comparing them against
+    /// text queries is near-random (see
+    /// `docs/search-infrastructure-review.md` §2.1).
+    fn caption_rep_frame(&self, frame: &CapturedFrame, seq: u64) -> Result<String> {
+        let path = self
             .tmp_dir
-            .join(format!("{}-{seq:06}.wav", self.file_prefix));
-        crate::audio::write_wav(&wav_path, samples)?;
+            .join(format!("{}-{seq:06}-caption.jpg", self.file_prefix));
+        self.write_jpeg(frame, &path)?;
+
+        let messages = build_caption_messages(&path);
         let raw = self
             .model
-            .embed_audio(&wav_path)
-            .context("cactus audio embed")?;
-        let pooled = mean_pool(&raw, GEMMA4_HIDDEN_DIM).context("mean pool audio embedding")?;
-        Ok(pooled)
+            .complete(
+                &messages,
+                Some(r#"{"max_tokens":80,"temperature":0.2}"#),
+            )
+            .context("cactus_complete for caption failed")?;
+        let text = extract_final_text(&raw);
+        let cleaned = text.trim().trim_matches('"').trim().to_string();
+        if cleaned.is_empty() {
+            anyhow::bail!("gemma returned empty caption");
+        }
+        Ok(cleaned)
     }
+}
+
+/// Build a Cactus vision-message array requesting a one-sentence
+/// description of the supplied JPEG. Kept as a free function so it's
+/// trivial to unit-test the string shape without owning a model.
+#[cfg(feature = "cactus")]
+fn build_caption_messages(image_path: &Path) -> String {
+    let path_str = image_path.to_string_lossy();
+    serde_json::json!([
+        {
+            "role": "system",
+            "content": "You are a security-camera captioner. Describe each scene \
+                        in ONE concise sentence. Mention people, objects, actions, \
+                        and notable visual details. Do NOT think out loud or use \
+                        any reasoning channel. Output the caption only."
+        },
+        {
+            "role": "user",
+            "content": "Describe this scene in one sentence.",
+            "images": [path_str],
+        }
+    ])
+    .to_string()
 }
 
 #[cfg(feature = "cactus")]
 impl CactusEmbedder {
     fn embed_chunk_blocking(&self, input: &ChunkInput, seq: u64) -> Result<EmbeddingOutput> {
-        let mut video_emb = self.embed_frames(&input.frames, seq)?;
-        let video_dim = video_emb.len();
-        l2_normalize(&mut video_emb);
+        anyhow::ensure!(!input.frames.is_empty(), "no frames in chunk");
 
-        let mut audio_emb = self.embed_audio(&input.audio_samples, seq)?;
-        let audio_dim = audio_emb.len();
-        if !audio_emb.is_empty() {
-            l2_normalize(&mut audio_emb);
+        // Caption the middle frame via Gemma-4 vision. This is the
+        // *only* signal we turn into a retrieval vector — see §2.1 of
+        // the search-infrastructure review for why pooled vision-tower
+        // states were junk.
+        let mid = input.frames.len() / 2;
+        let rep_frame = &input.frames[mid];
+        let caption = self.caption_rep_frame(rep_frame, seq)?;
+
+        // Text-embed the caption through the same encoder used by the
+        // leader at query time. Same space, well-posed cosine.
+        let mut embedding = self
+            .model
+            .embed_text(&caption, /* normalize = */ true)
+            .context("cactus_embed for caption failed")?;
+        if embedding.is_empty() {
+            anyhow::bail!("cactus_embed returned an empty caption vector");
         }
-
-        // Concatenate [video || audio] per PRD §5.2.
-        let mut embedding = video_emb;
-        embedding.extend_from_slice(&audio_emb);
-        l2_normalize(&mut embedding);
-
-        let k = input.frames.len();
-        let audio_secs = if !input.audio_samples.is_empty() {
-            input.audio_samples.len() as f32 / crate::audio::SAMPLE_RATE as f32
-        } else {
-            0.0
-        };
-        let caption = Some(format!("gemma-4 chunk: {k} frames, {audio_secs:.1}s audio"));
+        // Belt-and-braces: Cactus already normalized, but guard against
+        // any backend that quietly returns zero / non-finite values.
+        if !l2_normalize(&mut embedding) {
+            anyhow::bail!(
+                "caption embedding was zero / non-finite; refusing to ship \
+                 a vector that would poison downstream cosine"
+            );
+        }
+        let video_dim = embedding.len();
 
         Ok(EmbeddingOutput {
             embedding,
             video_dim,
-            audio_dim,
-            caption,
+            audio_dim: 0,
+            caption: Some(caption),
         })
     }
 }

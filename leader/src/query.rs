@@ -1,9 +1,7 @@
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::cactus::CactusModel;
@@ -64,7 +62,10 @@ impl CactusQueryHandler {
 
         let response = extract_response(&raw);
         debug!(response = %response, "parse_nl_query: raw response");
-        let json_str = find_json(&response).unwrap_or(&response);
+        // Defense-in-depth: re-strip thinking markers in case Cactus wrapped
+        // the reasoning preamble inside the `response` field itself.
+        let cleaned = strip_thinking(&response);
+        let json_str = find_json(cleaned).unwrap_or(cleaned);
         let parsed: serde_json::Value = serde_json::from_str(json_str)
             .with_context(|| format!("gemma returned non-JSON: {response}"))?;
         info!("parse_nl_query: parsed JSON ok");
@@ -81,70 +82,64 @@ impl CactusQueryHandler {
         })
     }
 
-    pub async fn synthesize_answer(&self, query: &str, chunks: &[StoredChunk], store: &EmbeddingStore) -> Result<String> {
+    pub async fn synthesize_answer(&self, query: &str, chunks: &[StoredChunk], _store: &EmbeddingStore) -> Result<String> {
         if chunks.is_empty() {
             return Ok("No camera footage found matching your query.".into());
         }
 
-        // Load representative JPEGs from disk and write to temp files;
-        // Cactus reads them by path.
-        let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
-        let mut image_paths: Vec<String> = Vec::new();
-        for sc in chunks.iter().take(10) {
-            if let Some(jpeg) = store.get_thumbnail(&sc.chunk.chunk_id) {
-                let mut tmp = tempfile::Builder::new()
-                    .suffix(".jpg")
-                    .tempfile()
-                    .context("create temp jpeg")?;
-                tmp.write_all(&jpeg).context("write temp jpeg")?;
-                image_paths.push(tmp.path().to_string_lossy().into_owned());
-                temp_files.push(tmp);
-            }
-        }
-
+        // Answer from **captions only** — now that the follower produces
+        // real Gemma-4 captions for every chunk (P0-1), we no longer
+        // need to re-show the JPEGs here. Feeding the images back to
+        // Gemma makes it ignore the question and just describe the
+        // scene (e.g. "The image shows a man with glasses..."), which
+        // is the failure mode we were debugging. Captions already
+        // contain the semantic signal; trust them.
         let observations: Vec<String> = chunks
             .iter()
-            .map(|sc| {
+            .take(20)
+            .enumerate()
+            .map(|(i, sc)| {
                 format!(
-                    "[{} {}ms–{}ms] {}",
-                    sc.chunk.camera_id,
-                    sc.chunk.start_ts_ms,
-                    sc.chunk.end_ts_ms,
-                    sc.chunk.caption.as_deref().unwrap_or("no description"),
+                    "{idx}. [{cam} {start}ms–{end}ms] {cap}",
+                    idx = i + 1,
+                    cam = sc.chunk.camera_id,
+                    start = sc.chunk.start_ts_ms,
+                    end = sc.chunk.end_ts_ms,
+                    cap = sc.chunk.caption.as_deref().unwrap_or("(no caption)"),
                 )
             })
             .collect();
 
-        let content = format!(
-            "You are a security camera monitoring assistant. A user asked a question about camera footage.\n\n\
+        // NB: Cactus + Gemma-4 silently drops the user turn when a `system`
+        // role precedes it (the model replies "please provide a question"),
+        // so we inline the instructions into a single user message instead.
+        let prompt = format!(
+            "You are a security-camera monitoring assistant. Answer the user's \
+            question using ONLY the provided captions (one per 5-second video \
+            chunk). You never see images; trust the captions. If the captions \
+            do not contain enough information to answer, say so plainly. Do \
+            NOT think out loud or use any reasoning channel. Start yes/no \
+            questions with YES or NO.\n\n\
             User question: \"{query}\"\n\n\
-            You are given {n_frames} camera frames from the relevant time periods, plus these metadata observations:\n\
+            Relevant camera captions ({n} chunks, most relevant first):\n\
             {obs}\n\n\
-            Instructions:\n\
-            - Answer the user's SPECIFIC question directly. Do NOT describe the images.\n\
-            - Start with YES or NO if it's a yes/no question.\n\
-            - Cite the camera ID and time when relevant, e.g. [cam-local 2:03 PM].\n\
-            - Keep your answer to 1-3 sentences maximum.\n\
-            - Do NOT think out loud or use any reasoning channel.\n\n\
+            Answer the question in 1–3 sentences. Cite chunk index and camera \
+            id when relevant, e.g. \"(#2, cam-local)\". If the captions don't \
+            mention anything matching the question, say \"No, the captured \
+            footage does not show that.\"\n\n\
+            Question again: \"{query}\"\n\
             Answer:",
-            n_frames = image_paths.len(),
+            n = observations.len(),
             obs = observations.join("\n"),
         );
 
-        let messages = if image_paths.is_empty() {
-            text_messages(&content)
-        } else {
-            vision_messages(&content, &image_paths)
-        };
+        let messages = text_messages(&prompt);
 
         let model = Arc::clone(&self.model);
-        let n_images = image_paths.len();
-        info!(n_chunks = chunks.len(), n_images, "synthesize_answer: invoking gemma");
+        info!(n_chunks = chunks.len(), "synthesize_answer: invoking gemma (captions-only)");
         let t0 = Instant::now();
         let raw = tokio::task::spawn_blocking(move || {
-            // Keep temp files alive until Cactus finishes reading them.
-            let _keep = temp_files;
-            model.complete(&messages, Some(r#"{"max_tokens":1024}"#))
+            model.complete(&messages, Some(r#"{"max_tokens":512,"temperature":0.2}"#))
         })
         .await
         .context("synthesis task panicked")?
@@ -167,15 +162,6 @@ fn text_messages(content: &str) -> String {
     format!(r#"[{{"role":"user","content":"{escaped}"}}]"#)
 }
 
-fn vision_messages(content: &str, image_paths: &[String]) -> String {
-    json!([{
-        "role": "user",
-        "content": content,
-        "images": image_paths,
-    }])
-    .to_string()
-}
-
 fn extract_response(raw: &str) -> String {
     let body = serde_json::from_str::<serde_json::Value>(raw)
         .ok()
@@ -184,17 +170,47 @@ fn extract_response(raw: &str) -> String {
     strip_thinking(&body).to_string()
 }
 
-/// Gemma 4 emits `<|channel>thought ... <|channel>final` style preambles.
-/// Return the substring after the last `<|channel>` marker so callers see
-/// only the final-answer text.
+/// Gemma 4 emits Harmony-style reasoning preambles like
+/// `<|channel|>analysis<|message|>...thought...<|end|><|start|>assistant<|channel|>final<|message|>...answer...`.
+/// Return the substring after the last `<|channel|>final<|message|>`
+/// (or the last `<|message|>` if that sentinel is missing), stripping any
+/// trailing `<|end|>` / `<|return|>` markers. Falls back to the legacy
+/// `<|channel>` (no trailing pipe) form we used to emit, and finally to
+/// the input unchanged when no marker is present.
 fn strip_thinking(text: &str) -> &str {
-    if let Some(idx) = text.rfind("<|channel>") {
+    // Prefer the Harmony `<|channel|>final<|message|>` anchor so we skip
+    // any `analysis`/`commentary` channels Gemma emits first.
+    let body: &str = if let Some(start) = text.rfind("<|channel|>final<|message|>") {
+        let rest = &text[start + "<|channel|>final<|message|>".len()..];
+        rest
+    } else if let Some(start) = text.rfind("<|message|>") {
+        &text[start + "<|message|>".len()..]
+    } else if let Some(idx) = text.rfind("<|channel|>") {
+        // No explicit message marker — fall back to "after the last channel".
         let rest = &text[idx..];
-        if let Some(nl) = rest.find('\n') {
-            return rest[nl + 1..].trim_start();
+        match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        }
+    } else if let Some(idx) = text.rfind("<|channel>") {
+        // Legacy (no trailing pipe) form from earlier cactus builds.
+        let rest = &text[idx..];
+        match rest.find('\n') {
+            Some(nl) => &rest[nl + 1..],
+            None => rest,
+        }
+    } else {
+        text
+    };
+
+    // Trim trailing end-of-message sentinels so JSON parsing works.
+    let mut out = body.trim_start();
+    for marker in ["<|end|>", "<|return|>", "<|endoftext|>"] {
+        if let Some(i) = out.find(marker) {
+            out = &out[..i];
         }
     }
-    text
+    out.trim()
 }
 
 fn find_json(text: &str) -> Option<&str> {
@@ -227,5 +243,30 @@ mod tests {
     #[test]
     fn extract_response_falls_back_to_raw() {
         assert_eq!(extract_response("plain text"), "plain text");
+    }
+
+    #[test]
+    fn strip_thinking_handles_harmony_final_channel() {
+        let raw = "<|channel|>analysis<|message|>hmm, let me think...<|end|>\
+                   <|start|>assistant<|channel|>final<|message|>\
+                   {\"top_k\":20}<|return|>";
+        assert_eq!(strip_thinking(raw), r#"{"top_k":20}"#);
+    }
+
+    #[test]
+    fn strip_thinking_handles_legacy_no_pipe_marker() {
+        let raw = "<|channel>final\n{\"top_k\":20}";
+        assert_eq!(strip_thinking(raw), r#"{"top_k":20}"#);
+    }
+
+    #[test]
+    fn strip_thinking_passthrough_when_no_markers() {
+        assert_eq!(strip_thinking("hello world"), "hello world");
+    }
+
+    #[test]
+    fn extract_response_unwraps_and_strips_thinking() {
+        let raw = r#"{"response":"<|channel|>final<|message|>{\"top_k\":20}<|return|>"}"#;
+        assert_eq!(extract_response(raw), r#"{"top_k":20}"#);
     }
 }

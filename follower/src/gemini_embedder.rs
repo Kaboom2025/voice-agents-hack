@@ -5,25 +5,31 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use crate::audio;
 use crate::camera::CapturedFrame;
 use crate::embedder::{ChunkInput, EmbeddingOutput};
-use crate::frame_buffer::FrameBuffer;
 use crate::gemini_client::{GeminiEmbedClient, MediaPart};
 
-pub struct VideoEmbeddingOutput {
-    pub embedding: Vec<f32>,
-    pub caption: Option<String>,
-    pub start_ts_ms: u64,
-    pub end_ts_ms: u64,
+/// Encode `frame` as a JPEG at `quality` (0..=100). Free function used by
+/// both the Gemini embedder and the follower's main loop when it needs a
+/// representative thumbnail for a chunk.
+pub fn encode_jpeg_bytes(frame: &CapturedFrame, quality: u8) -> Result<Vec<u8>> {
+    use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
+    let capacity = (frame.width as usize * frame.height as usize / 4).max(4096);
+    let mut buf = Vec::with_capacity(capacity);
+    JpegEncoder::new_with_quality(&mut buf, quality)
+        .encode(
+            frame.rgb.as_slice(),
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
+    Ok(buf)
 }
 
-#[async_trait]
-pub trait VideoEmbedder: Send + Sync {
-    async fn embed_window(&self, buffer: &FrameBuffer) -> Result<VideoEmbeddingOutput>;
-}
-
-pub struct GeminiVideoEmbedder {
-    client: GeminiEmbedClient,
-    target_fps: f32,
-    jpeg_quality: u8,
+/// Encode `frame` as a JPEG and base64-encode the result (Gemini API
+/// ingests inline media as base64-encoded bytes).
+pub fn encode_jpeg_b64(frame: &CapturedFrame, quality: u8) -> Result<String> {
+    let bytes = encode_jpeg_bytes(frame, quality)?;
+    Ok(B64.encode(&bytes))
 }
 
 /// Implements the synchronous `Embedder` trait using the Gemini REST API.
@@ -59,7 +65,7 @@ impl crate::embedder::Embedder for GeminiEmbedder {
                 let mut parts: Vec<MediaPart> = frames
                     .iter()
                     .map(|f| {
-                        let b64 = GeminiVideoEmbedder::encode_jpeg_b64(f, quality)?;
+                        let b64 = encode_jpeg_b64(f, quality)?;
                         Ok(MediaPart {
                             mime_type: "image/jpeg".to_string(),
                             data_b64: b64,
@@ -91,11 +97,11 @@ impl crate::embedder::Embedder for GeminiEmbedder {
         let has_audio = media_parts.iter().any(|p| p.mime_type == "audio/wav");
         let mut embedding = self.client.embed(media_parts).await?;
 
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for x in embedding.iter_mut() {
-                *x /= norm;
-            }
+        if !l2_normalize(&mut embedding) {
+            anyhow::bail!(
+                "gemini returned a zero / non-finite embedding; refusing to \
+                 ship a poisoned vector downstream"
+            );
         }
 
         // Gemini returns a single fused multimodal vector — the model
@@ -126,87 +132,21 @@ impl crate::embedder::Embedder for GeminiEmbedder {
     }
 }
 
-fn l2_normalize(v: &mut [f32]) {
+/// L2-normalize in place. Returns `false` (leaving the input unchanged)
+/// on zero-norm vectors or if any element is non-finite (NaN/inf).
+/// Mirrors `follower::cactus::l2_normalize`.
+fn l2_normalize(v: &mut [f32]) -> bool {
+    if !v.iter().all(|x| x.is_finite()) {
+        return false;
+    }
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
+    if !(norm > 0.0 && norm.is_finite()) {
+        return false;
     }
-}
-
-impl GeminiVideoEmbedder {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            client: GeminiEmbedClient::new(api_key),
-            target_fps: 2.0,
-            jpeg_quality: 80,
-        }
+    for x in v.iter_mut() {
+        *x /= norm;
     }
-
-    pub fn encode_jpeg_bytes(frame: &CapturedFrame, quality: u8) -> Result<Vec<u8>> {
-        use image::{codecs::jpeg::JpegEncoder, ExtendedColorType};
-        let capacity = (frame.width as usize * frame.height as usize / 4).max(4096);
-        let mut buf = Vec::with_capacity(capacity);
-        JpegEncoder::new_with_quality(&mut buf, quality)
-            .encode(
-                frame.rgb.as_slice(),
-                frame.width,
-                frame.height,
-                ExtendedColorType::Rgb8,
-            )
-            .map_err(|e| anyhow::anyhow!("jpeg encode: {e}"))?;
-        Ok(buf)
-    }
-
-    pub fn encode_jpeg_b64(frame: &CapturedFrame, quality: u8) -> Result<String> {
-        let bytes = Self::encode_jpeg_bytes(frame, quality)?;
-        Ok(B64.encode(&bytes))
-    }
-
-    pub fn window_timestamps(buffer: &FrameBuffer) -> (u64, u64) {
-        let w = buffer.window();
-        match (w.first(), w.last()) {
-            (Some((s, _)), Some((e, _))) => (*s, *e),
-            _ => (0, 0),
-        }
-    }
-}
-
-#[async_trait]
-impl VideoEmbedder for GeminiVideoEmbedder {
-    async fn embed_window(&self, buffer: &FrameBuffer) -> Result<VideoEmbeddingOutput> {
-        let (start_ts_ms, end_ts_ms) = Self::window_timestamps(buffer);
-        let sampled = buffer.sample(self.target_fps);
-
-        anyhow::ensure!(!sampled.is_empty(), "frame buffer is empty — cannot embed");
-
-        let quality = self.jpeg_quality;
-        let media_parts: Vec<MediaPart> = sampled
-            .iter()
-            .map(|f| {
-                let b64 = Self::encode_jpeg_b64(f, quality)?;
-                Ok(MediaPart {
-                    mime_type: "image/jpeg".to_string(),
-                    data_b64: b64,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let n_frames = media_parts.len();
-        let mut values = self.client.embed(media_parts).await?;
-        l2_normalize(&mut values);
-
-        Ok(VideoEmbeddingOutput {
-            embedding: values,
-            caption: Some(format!(
-                "gemini-video window={}-{}ms frames={}",
-                start_ts_ms, end_ts_ms, n_frames
-            )),
-            start_ts_ms,
-            end_ts_ms,
-        })
-    }
+    true
 }
 
 #[cfg(test)]
@@ -225,7 +165,7 @@ mod tests {
     #[test]
     fn encode_jpeg_bytes_produces_nonempty_output() {
         let frame = grey_frame(64, 64, 128);
-        let bytes = GeminiVideoEmbedder::encode_jpeg_bytes(&frame, 85).unwrap();
+        let bytes = encode_jpeg_bytes(&frame, 85).unwrap();
         assert!(bytes.starts_with(&[0xFF, 0xD8]));
         assert!(bytes.len() > 100);
     }
@@ -233,58 +173,8 @@ mod tests {
     #[test]
     fn encode_jpeg_b64_is_valid_base64() {
         let frame = grey_frame(32, 32, 200);
-        let b64 = GeminiVideoEmbedder::encode_jpeg_b64(&frame, 85).unwrap();
+        let b64 = encode_jpeg_b64(&frame, 85).unwrap();
         let decoded = B64.decode(&b64).unwrap();
         assert!(decoded.starts_with(&[0xFF, 0xD8]));
-    }
-
-    #[test]
-    fn window_timestamps_span_buffer_content() {
-        let buf = FrameBuffer::new(10_000);
-        buf.push(1000, grey_frame(4, 4, 10));
-        buf.push(4000, grey_frame(4, 4, 20));
-        buf.push(8000, grey_frame(4, 4, 30));
-        let (start, end) = GeminiVideoEmbedder::window_timestamps(&buf);
-        assert_eq!(start, 1000);
-        assert_eq!(end, 8000);
-    }
-
-    #[test]
-    fn window_timestamps_both_zero_on_empty_buffer() {
-        let buf = FrameBuffer::new(10_000);
-        let (start, end) = GeminiVideoEmbedder::window_timestamps(&buf);
-        assert_eq!(start, 0);
-        assert_eq!(end, 0);
-    }
-
-    #[tokio::test]
-    async fn live_embed_window_returns_3072_dim_embedding() {
-        let Ok(key) = std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("gemini_api_key"))
-        else {
-            eprintln!("GEMINI_API_KEY not set — skipping live test");
-            return;
-        };
-        let buf = FrameBuffer::new(10_000);
-        for i in 0u64..3 {
-            buf.push(i * 1000, grey_frame(64, 64, (50 + i * 60) as u8));
-        }
-        let embedder = GeminiVideoEmbedder::new(key);
-        match embedder.embed_window(&buf).await {
-            Ok(out) => {
-                println!(
-                    "dim={} start={} end={}",
-                    out.embedding.len(),
-                    out.start_ts_ms,
-                    out.end_ts_ms
-                );
-                assert!(!out.embedding.is_empty());
-                let norm: f32 = out.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-                assert!(
-                    (norm - 1.0).abs() < 1e-3,
-                    "embedding should be L2-normalised, norm={norm}"
-                );
-            }
-            Err(e) => eprintln!("live embed error: {e}"),
-        }
     }
 }
