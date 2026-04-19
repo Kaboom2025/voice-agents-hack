@@ -149,7 +149,7 @@ where
     }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_BYTES {
-        bail!("incoming frame too large: {len} bytes");
+        bail!("incoming frame too large: {len} bytes (hex: {len_buf:02x?})");
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;

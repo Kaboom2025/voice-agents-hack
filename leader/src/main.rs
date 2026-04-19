@@ -327,6 +327,17 @@ async fn serve_stream(
         let _ = send.finish();
     });
 
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(64);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            let res = read_frame::<_, FollowerMsg>(&mut recv).await;
+            let is_err_or_eof = res.is_err() || matches!(res, Ok(None));
+            if inbound_tx.send(res).await.is_err() || is_err_or_eof {
+                break;
+            }
+        }
+    });
+
     let mut pending: HashMap<u64, oneshot::Sender<FrameOutcome>> = HashMap::new();
     let mut camera_id: Option<String> = None;
     let mut entry: Option<CameraEntry> = None;
@@ -334,15 +345,17 @@ async fn serve_stream(
     loop {
         tokio::select! {
             // Inbound traffic from the follower.
-            msg = read_frame::<_, FollowerMsg>(&mut recv) => {
-                let msg = match msg {
+            opt = inbound_rx.recv() => {
+                let Some(msg_res) = opt else { break; };
+                let msg = match msg_res {
                     Ok(Some(m)) => m,
                     Ok(None) => {
                         debug!("clean EOF from follower stream");
                         break;
                     }
                     Err(e) => {
-                        error!(%e, "stream read failed - remote connection likely severed or frame excessively large");
+                        let cid_str = camera_id.as_deref().unwrap_or("<unknown>");
+                        error!(camera_id = %cid_str, %remote, %e, "stream read failed - remote connection likely severed or frame excessively large");
                         break;
                     }
                 };
@@ -421,6 +434,7 @@ async fn serve_stream(
     }
 
     writer_task.abort();
+    reader_task.abort();
 
     // Cleanup: drop the registration so HTTP requests stop landing here, and
     // cancel any pending oneshots so callers see an error instead of hanging.
